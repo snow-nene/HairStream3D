@@ -65,6 +65,8 @@ def main():
     parser.add_argument('--model_type_sam', default='vit_h')
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--width', type=int, default=512)
+    parser.add_argument('--max_samples', type=int, default=0,
+                        help='Limit to N images (0 = all). Use for smoke test.')
     args = parser.parse_args()
 
     os.makedirs(os.path.join(args.output_dir, 'img'), exist_ok=True)
@@ -78,6 +80,8 @@ def main():
 
     # ── 收集图片 ──
     image_paths = collect_images(args.input_dir)
+    if args.max_samples > 0:
+        image_paths = image_paths[:args.max_samples]
     print(f"Found {len(image_paths)} images to process")
 
     success, skipped = 0, 0

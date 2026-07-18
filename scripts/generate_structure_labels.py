@@ -124,6 +124,8 @@ def main():
                         help='Inner Gaussian sigma for structure tensor')
     parser.add_argument('--sigma_outer', type=float, default=9.0,
                         help='Outer Gaussian sigma for structure tensor')
+    parser.add_argument('--max_samples', type=int, default=0,
+                        help='Limit to N images (0 = all). Use for smoke test.')
     args = parser.parse_args()
 
     img_dir = os.path.join(args.input_dir, 'img')
@@ -139,6 +141,8 @@ def main():
     # ── 收集图片列表 ──
     img_files = sorted(f for f in os.listdir(img_dir)
                        if f.lower().endswith(('.png', '.jpg', '.jpeg')))
+    if args.max_samples > 0:
+        img_files = img_files[:args.max_samples]
 
     print(f"Found {len(img_files)} images in {img_dir}")
     print(f"sigma_inner={args.sigma_inner}, sigma_outer={args.sigma_outer}")

@@ -180,14 +180,21 @@ def pretrain(opt):
     dataset = PretrainDataset(data_root, split_file)
     print(f"  Samples: {len(dataset)}")
 
+    # ── 限制样本数（冒烟测试，必须在 DataLoader 之前截断） ──
+    if opt.max_samples > 0 and opt.max_samples < len(dataset):
+        import random as _random
+        _random.seed(42)
+        dataset.items = _random.sample(dataset.items, opt.max_samples)
+        print(f"  Limited to {opt.max_samples} samples (smoke test)")
+
     loader_kwargs = {
-        'batch_size': opt.batch_size,
+        'batch_size': max(1, min(opt.batch_size, len(dataset))),
         'shuffle': True,
-        'num_workers': opt.num_threads,
+        'num_workers': opt.num_threads if len(dataset) > 4 else 0,
         'pin_memory': opt.pin_memory,
         'drop_last': True,
     }
-    if opt.num_threads > 0:
+    if opt.num_threads > 0 and len(dataset) > 4:
         loader_kwargs['persistent_workers'] = True
         loader_kwargs['prefetch_factor'] = 2
 

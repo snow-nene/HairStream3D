@@ -50,9 +50,11 @@ checkpoints/img2hairstep/hrnet_w32/  (最终模型)
 
 ### 运行
 ```bash
-PYTHONPATH=. pixi run python scripts/batch_generate_masks.py \
-  --input_dir datasets/0002.mqset \
-  --output_dir datasets/pretrain
+# 冒烟测试（仅 5 张）
+PYTHONPATH=. pixi run python scripts/batch_generate_masks.py --max_samples 5
+
+# 全量（48,252 张）
+PYTHONPATH=. pixi run python scripts/batch_generate_masks.py
 ```
 
 ---

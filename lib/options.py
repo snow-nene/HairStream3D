@@ -59,6 +59,8 @@ class BaseOptions():
         
         g_train.add_argument('--resume_epoch', type=int, default=-1, help='epoch resuming the training')
         g_train.add_argument('--continue_train', action='store_true', help='continue training: load the latest model')
+        g_train.add_argument('--max_samples', type=int, default=0,
+                             help='Limit training to N samples (0 = all). Use for smoke test.')
 
         # Testing related
         g_test = parser.add_argument_group('Testing')
