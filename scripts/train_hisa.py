@@ -13,6 +13,7 @@ from tqdm import tqdm
 
 from lib.options import BaseOptions
 from lib.model.img2hairstep.model_factory import create_img2strand_model
+from lib.model.img2hairstep.criterion.hairstep_losses import HairStepLoss
 
 
 def get_model_tag(opt):
@@ -184,7 +185,7 @@ def train(opt):
         return
         
     print("Loading dataset...")
-    train_dataset = HiSaDataset(data_root, train_split, augment=True)
+    train_dataset = HiSaDataset(data_root, train_split, augment=False)
 
     loader_kwargs = {
         'batch_size': opt.batch_size,
@@ -226,11 +227,26 @@ def train(opt):
             print("Warning: continue_train is set but no checkpoint was found.")
         
     optimizer = optim.Adam(model.parameters(), lr=opt.learning_rate)
+
+    # --- Comprehensive loss function ---
+    # Weights: cos=1.0 (primary), tv=0.1 (smoothness), struct=0.05 (geometric), aux=0.3 (multi-scale)
+    criterion = HairStepLoss(
+        w_l1=getattr(opt, 'w_l1', 0.0),
+        w_cos=getattr(opt, 'w_cos', 1.0),
+        w_tv=getattr(opt, 'w_tv', 0.1),
+        w_struct=getattr(opt, 'w_struct', 0.05),
+        w_aux=getattr(opt, 'w_aux', 0.3),
+    )
+    multi_scale_enabled = getattr(opt, 'multi_scale_supervision', True)
+
+    print(f"Loss weights: l1={criterion.w_l1}, cos={criterion.w_cos}, tv={criterion.w_tv}, struct={criterion.w_struct}, aux={criterion.w_aux}")
+    print(f"Multi-scale supervision: {'enabled' if multi_scale_enabled else 'disabled'}")
     
     print(f"Starting training for {opt.num_epoch} epochs...")
     for epoch in range(start_epoch, opt.num_epoch):
         model.train()
-        running_loss = 0.0
+        running_total = 0.0
+        running_components = {'l1': 0.0, 'cos': 0.0, 'tv': 0.0, 'struct': 0.0, 'aux': 0.0}
         
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{opt.num_epoch-1}")
         for rgb_img, strand_gt, mask in pbar:
@@ -240,23 +256,44 @@ def train(opt):
             
             optimizer.zero_grad()
             
-            strand_pred = model(rgb_img)
-            
-            # Paper-style masked L1: sum(|pred-gt|*M) / (C * sum(M))
-            strand_pred_masked = strand_pred * mask
-            strand_gt_masked = strand_gt * mask
+            # Forward pass – model now returns (pred_main, aux_preds) for HRNet
+            model_out = model(rgb_img)
+            if isinstance(model_out, tuple):
+                strand_pred, aux_preds = model_out
+            else:
+                strand_pred = model_out
+                aux_preds = None
 
-            abs_err = torch.abs(strand_pred_masked - strand_gt_masked).sum()
-            valid = (mask.sum() * strand_pred.shape[1]).clamp_min(1.0)
-            loss = abs_err / valid
-            loss.backward()
+            if not multi_scale_enabled:
+                aux_preds = None
+            
+            # Compute comprehensive loss
+            total_loss, loss_dict = criterion(strand_pred, aux_preds, strand_gt, mask)
+            total_loss.backward()
             optimizer.step()
             
-            running_loss += loss.item()
-            pbar.set_postfix({'loss': loss.item()})
+            running_total += total_loss.item()
+            for k in running_components:
+                running_components[k] += loss_dict[k].item()
+
+            pbar.set_postfix({
+                'L1': f'{loss_dict["l1"].item():.3f}',
+                'cos': f'{loss_dict["cos"].item():.3f}',
+                'tv': f'{loss_dict["tv"].item():.3f}',
+                'st': f'{loss_dict["struct"].item():.3f}',
+                'aux': f'{loss_dict["aux"].item():.3f}',
+                'tot': f'{total_loss.item():.3f}',
+            })
             
-        epoch_loss = running_loss / len(train_loader)
-        print(f"Epoch {epoch} Average Loss: {epoch_loss:.6f}")
+        n = len(train_loader)
+        epoch_total = running_total / n
+        print(f"Epoch {epoch} Avg | "
+              f"total={epoch_total:.4f}  "
+              f"l1={running_components['l1']/n:.4f}  "
+              f"cos={running_components['cos']/n:.4f}  "
+              f"tv={running_components['tv']/n:.4f}  "
+              f"struct={running_components['struct']/n:.4f}  "
+              f"aux={running_components['aux']/n:.4f}")
         
         if epoch % opt.freq_save == 0 or epoch == opt.num_epoch - 1:
             save_path = os.path.join(save_dir, f'img2strand_{model_tag}_epoch_{epoch}.pth')

@@ -2,6 +2,33 @@
 
 This document explains how to train strand-map prediction with `scripts/train_hisa.py`.
 
+```
+# 论文原作 baseline（仅 L1）
+PYTHONPATH=. pixi run python scripts/train_hisa.py \
+  --img2strand_backbone hrnet --hrnet_variant hrnet_w32 \
+  --w_l1 1.0 --w_cos 0.0 --w_tv 0.0 --w_struct 0.0 --w_aux 0.0
+
+# L1 + 余弦 + TV + 结构 + 多尺度（全量）
+PYTHONPATH=. pixi run python scripts/train_hisa.py \
+  --img2strand_backbone hrnet --hrnet_variant hrnet_w32 \
+  --w_l1 1.0 --w_cos 1.0 --w_tv 0.0 --w_struct 0.0 --w_aux 0.3
+
+```
+
+```
+# 仅余弦相似度（baseline）
+pixi run python scripts/train_hisa.py --w_cos 1.0 --w_tv 0.0 --w_struct 0.0 --w_aux 0.0
+
+# cosine + TV 平滑
+pixi run python scripts/train_hisa.py --w_cos 1.0 --w_tv 0.1 --w_struct 0.0 --w_aux 0.0
+
+# cosine + TV + 结构相似性
+pixi run python scripts/train_hisa.py --w_cos 1.0 --w_tv 0.1 --w_struct 0.05 --w_aux 0.0
+
+# 全量损失（推荐）
+pixi run python scripts/train_hisa.py --w_cos 1.0 --w_tv 0.1 --w_struct 0.05 --w_aux 0.3
+
+```
 ## 1. Basic command
 
 ```bash

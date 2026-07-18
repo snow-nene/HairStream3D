@@ -40,7 +40,7 @@ class BaseOptions():
         
         g_train.add_argument('--batch_size', type=int, default=1, help='input batch size')
         g_train.add_argument('--learning_rate', type=float, default=1e-4, help='adam learning rate')
-        g_train.add_argument('--num_epoch', type=int, default=1001, help='num epoch to train')
+        g_train.add_argument('--num_epoch', type=int, default=50, help='num epoch to train')
 
         g_train.add_argument('--freq_plot', type=int, default=10, help='freqency of the error plot')
         g_train.add_argument('--freq_save', type=int, default=50, help='freqency of the save_checkpoints')
@@ -96,6 +96,18 @@ class BaseOptions():
                      help='Use ImageNet pretrained timm HRNet weights.')
         g_model.add_argument('--hrnet_decoder_channels', type=int, default=128,
                      help='Decoder channels for HRNet fusion head.')
+        g_model.add_argument('--multi_scale_supervision', type=lambda x: x.lower() == 'true', default=True,
+                     help='Enable multi-scale auxiliary supervision on HRNet branches (True/False).')
+        g_model.add_argument('--w_l1', type=float, default=0.0,
+                     help='Weight for L1 (masked MAE) loss — HairStep paper Eq. (2). Set to 0 to disable.')
+        g_model.add_argument('--w_cos', type=float, default=1.0,
+                     help='Weight for cosine similarity loss.')
+        g_model.add_argument('--w_tv', type=float, default=0.1,
+                     help='Weight for total variation (TV) smoothness loss. Set to 0 to disable.')
+        g_model.add_argument('--w_struct', type=float, default=0.05,
+                     help='Weight for structural similarity (gradient+laplacian) loss. Set to 0 to disable.')
+        g_model.add_argument('--w_aux', type=float, default=0.3,
+                     help='Weight for multi-scale auxiliary supervision loss. Set to 0 to disable.')
 
         # for train
         parser.add_argument('--finetune', action='store_true', help='if generate orientation')

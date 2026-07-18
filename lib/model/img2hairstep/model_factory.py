@@ -13,6 +13,7 @@ def create_img2strand_model(opt):
             pretrained=getattr(opt, 'hrnet_pretrained', False),
             out_channels=2,
             decoder_channels=getattr(opt, 'hrnet_decoder_channels', 128),
+            multi_scale_supervision=getattr(opt, 'multi_scale_supervision', True),
         )
 
     raise ValueError('Unsupported img2strand_backbone: {}'.format(backbone))
