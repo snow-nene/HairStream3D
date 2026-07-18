@@ -3,8 +3,8 @@
 Step 2: 批量生成 0-180° 方向场 + 置信度图（结构张量）
 
 对 datasets/pretrain/img/ 中每张图：
-  1. 调用 extract_structure_field 获取 field_x, field_y, coherence, hair_mask
-  2. 融合 SAM mask 和结构张量 mask
+  1. 读取 SAM mask
+  2. 调用 standard_structure_tensor_pipeline 获取 theta (0-π) 和 coherence
   3. 输出 strand_map (3通道: [mask, strand_x, strand_y]) 和 confidence 图
 
 Usage:
@@ -15,101 +15,87 @@ Usage:
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import json
 import argparse
 
 import cv2
 import numpy as np
+from PIL import Image
 from tqdm import tqdm
 
-from scripts.standard_pipeline import (
-    extract_structure_field,
-    read_image,
-    normalize_image,
-    to_gray,
-    _calc_structure_tensor,
-    compute_coherence,
-)
+# ── 直接调用 standard_pipeline.py 的 actual API ──
+from standard_pipeline import standard_structure_tensor_pipeline
 
 
-def _extract_dense_structure_tensor(img_rgb, sigma_inner, sigma_outer):
+def process_single_image(img_path, seg_path, sigma_integration,
+                         out_strand_dir, out_conf_dir):
     """
-    提取全图密集的结构张量方向场（不追踪流线，直接用张量方向）。
-    返回: field_x, field_y (H, W), coherence (H, W), hair_mask (H, W)
+    单张图片处理：
+      1. 读取全图 + mask
+      2. 调用 standard_structure_tensor_pipeline(rgb, mask, sigma) → theta, coherence
+      3. theta → (cosθ, sinθ) → strand_map
+      4. coherence → confidence
     """
-    gray = to_gray(img_rgb)
-    gray_norm = normalize_image(gray)
-
-    lambda1, lambda2, vx, vy = _calc_structure_tensor(
-        gray_norm, sigma_inner=sigma_inner, sigma_outer=sigma_outer
-    )
-    coherence = compute_coherence(lambda1, lambda2)
-
-    # 全图 dense: field = (vx, vy) 就是方向向量
-    # 归一化已经在 _calc_structure_tensor 中完成
-
-    # 基于 coherence + brightness 的 hair mask
-    hair_mask = (coherence > 0.1) & (gray_norm > 0.05)
-
-    return vx.astype(np.float32), vy.astype(np.float32), coherence.astype(np.float32), hair_mask
-
-
-def process_single_image(img_path, seg_path, sigma_inner, sigma_outer,
-                         out_strand_dir, out_conf_dir, out_coherence_dir):
-    """处理单张图片，输出 strand_map 和 confidence"""
-    img = read_image(img_path)
-    if img is None:
-        return False
-
-    H, W = img.shape[:2]
-
-    # ── 读取 SAM mask ──
-    if os.path.exists(seg_path):
-        seg_mask = cv2.imread(seg_path, cv2.IMREAD_GRAYSCALE)
-        seg_mask = (seg_mask > 128).astype(np.float32)
-    else:
-        seg_mask = np.ones((H, W), dtype=np.float32)
-
-    # ── 密集结构张量 ──
+    # ── 读取全图 (RGB, [0,1] 归一化) ──
     try:
-        vx, vy, coherence, struct_mask = _extract_dense_structure_tensor(
-            img, sigma_inner, sigma_outer
+        img_pil = Image.open(img_path).convert("RGB")
+    except Exception:
+        return False
+    # 确保 512×512
+    img_pil = img_pil.resize((512, 512), Image.Resampling.LANCZOS)
+    rgb = np.asarray(img_pil, dtype=np.float32) / 255.0
+
+    # ── 读取 mask ──
+    if os.path.exists(seg_path):
+        mask_pil = Image.open(seg_path).convert("L")
+        mask_pil = mask_pil.resize((512, 512), Image.Resampling.NEAREST)
+        mask = np.array(mask_pil) > 127
+    else:
+        mask = np.ones((512, 512), dtype=bool)
+
+    # ── 结构张量 ──
+    try:
+        theta, coherence = standard_structure_tensor_pipeline(
+            rgb, mask, sigma_integration=sigma_integration
         )
     except Exception:
         return False
 
-    # ── 融合 mask：SAM ∩ 结构张量 mask ──
-    final_mask = seg_mask * struct_mask.astype(np.float32)
+    # ── mask 区域置零 ──
+    coherence = np.where(mask, coherence, 0.0).astype(np.float32)
+    final_mask = mask.astype(np.float32)
+
+    # ── theta [0, π) → (cosθ, sinθ) 方向向量 ──
+    # 注意: theta 表示头发切线方向，cos(θ) 是 x 分量，sin(θ) 是 y 分量
+    field_x = np.cos(theta).astype(np.float32)
+    field_y = np.sin(theta).astype(np.float32)
+    # mask 外用零
+    field_x = np.where(mask, field_x, 0.0)
+    field_y = np.where(mask, field_y, 0.0)
+
+    # ── 构造 strand_map (3通道) ──
+    # R = mask (0 或 255)
+    # G = (field_x + 1) / 2 * 255  → cosθ → [0, 255]
+    # B = (field_y + 1) / 2 * 255  → sinθ → [0, 255]
+    strand_map = np.zeros((512, 512, 3), dtype=np.uint8)
+    strand_map[:, :, 0] = (final_mask * 255).astype(np.uint8)
+
+    masked_x = field_x * final_mask
+    masked_y = field_y * final_mask
+    strand_map[:, :, 1] = np.clip((masked_x + 1.0) / 2.0 * 255.0, 0, 255).astype(np.uint8)
+    strand_map[:, :, 2] = np.clip((masked_y + 1.0) / 2.0 * 255.0, 0, 255).astype(np.uint8)
 
     # ── 置信度 = coherence × final_mask ──
     confidence = coherence * final_mask
-
-    # ── 构造 strand_map (3通道) ──
-    # R = mask (0 或 1)
-    # G = (field_x + 1) / 2 * 255  → cos θ → [0, 255]
-    # B = (field_y + 1) / 2 * 255  → sin θ → [0, 255]
-    strand_map = np.zeros((H, W, 3), dtype=np.uint8)
-    strand_map[:, :, 0] = (final_mask * 255).astype(np.uint8)
-
-    # 只对 mask 区域编码
-    masked_x = vx * final_mask
-    masked_y = vy * final_mask
-    strand_map[:, :, 1] = np.clip((masked_x + 1.0) / 2.0 * 255.0, 0, 255).astype(np.uint8)
-    strand_map[:, :, 2] = np.clip((masked_y + 1.0) / 2.0 * 255.0, 0, 255).astype(np.uint8)
 
     # ── 保存 ──
     basename = os.path.splitext(os.path.basename(img_path))[0]
     cv2.imwrite(os.path.join(out_strand_dir, f'{basename}.png'), strand_map)
 
-    # confidence: 0-1 → 0-255
     conf_img = (np.clip(confidence, 0, 1) * 255).astype(np.uint8)
     cv2.imwrite(os.path.join(out_conf_dir, f'{basename}.png'), conf_img)
-
-    # coherence（仅用于可视化/调试）
-    coh_img = (np.clip(coherence, 0, 1) * 255).astype(np.uint8)
-    cv2.imwrite(os.path.join(out_coherence_dir, f'{basename}.png'), coh_img)
 
     return True
 
@@ -119,11 +105,9 @@ def main():
     parser.add_argument('--input_dir', default='datasets/pretrain',
                         help='Directory containing img/ and seg/ subdirectories')
     parser.add_argument('--output_dir', default='datasets/pretrain',
-                        help='Output directory for strand_map/ confidence/ coherence/')
-    parser.add_argument('--sigma_inner', type=float, default=3.0,
-                        help='Inner Gaussian sigma for structure tensor')
-    parser.add_argument('--sigma_outer', type=float, default=9.0,
-                        help='Outer Gaussian sigma for structure tensor')
+                        help='Output directory for strand_map/ confidence/')
+    parser.add_argument('--sigma_integration', type=float, default=4.0,
+                        help='Gaussian integration sigma for structure tensor')
     parser.add_argument('--max_samples', type=int, default=0,
                         help='Limit to N images (0 = all). Use for smoke test.')
     args = parser.parse_args()
@@ -132,11 +116,9 @@ def main():
     seg_dir = os.path.join(args.input_dir, 'seg')
     strand_dir = os.path.join(args.output_dir, 'strand_map')
     conf_dir = os.path.join(args.output_dir, 'confidence')
-    coh_dir = os.path.join(args.output_dir, 'coherence')
 
     os.makedirs(strand_dir, exist_ok=True)
     os.makedirs(conf_dir, exist_ok=True)
-    os.makedirs(coh_dir, exist_ok=True)
 
     # ── 收集图片列表 ──
     img_files = sorted(f for f in os.listdir(img_dir)
@@ -145,7 +127,7 @@ def main():
         img_files = img_files[:args.max_samples]
 
     print(f"Found {len(img_files)} images in {img_dir}")
-    print(f"sigma_inner={args.sigma_inner}, sigma_outer={args.sigma_outer}")
+    print(f"sigma_integration={args.sigma_integration}")
 
     success = 0
     valid_items = []
@@ -156,8 +138,8 @@ def main():
 
         ok = process_single_image(
             img_path, seg_path,
-            args.sigma_inner, args.sigma_outer,
-            strand_dir, conf_dir, coh_dir,
+            args.sigma_integration,
+            strand_dir, conf_dir,
         )
         if ok:
             success += 1
