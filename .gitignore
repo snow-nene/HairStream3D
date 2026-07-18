@@ -130,4 +130,7 @@ dmypy.json
 # 
 checkpoints/
 external/
-# results/
+# results/# pixi environments
+.pixi/*
+!.pixi/config.toml
+results/
