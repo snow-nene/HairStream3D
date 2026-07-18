@@ -136,6 +136,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/jinja2-3.1.6-pyhcf101f3_1.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/lazy-loader-0.5-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/lazy_loader-0.5-pyhd8ed1ab_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/noarch/modelscope-1.37.1-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/mpmath-1.4.1-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/networkx-3.4.2-pyh267e887_2.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/packaging-26.2-pyhc364b38_0.conda
@@ -2132,6 +2133,22 @@ packages:
   run_exports: {}
   size: 7565
   timestamp: 1772817387506
+- conda: https://conda.anaconda.org/conda-forge/noarch/modelscope-1.37.1-pyhd8ed1ab_0.conda
+  sha256: b8c14ea25c4a5f55a794ddf27cd67162779a85ab3d1ec3b2bc1876dce364d1d7
+  md5: f98512564ee95492e53b3ecc7228c8ff
+  depends:
+  - filelock
+  - python >=3.10
+  - requests >=2.25
+  - tqdm >=4.64.0
+  - urllib3 >=1.26
+  license: Apache-2.0
+  license_family: APACHE
+  purls:
+  - pkg:pypi/modelscope?source=hash-mapping
+  run_exports: {}
+  size: 3225607
+  timestamp: 1779433637238
 - conda: https://conda.anaconda.org/conda-forge/noarch/mpmath-1.4.1-pyhd8ed1ab_0.conda
   sha256: 5bbf2f8179ec43d34d67ca8e4989d216c1bdb4b749fe6cb40e86ebf88c1b5300
   md5: 2e81b32b805f406d23ba61938a184081

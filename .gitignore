@@ -134,3 +134,4 @@ external/
 .pixi/*
 !.pixi/config.toml
 results/
+datasets/

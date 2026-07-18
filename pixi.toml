@@ -16,6 +16,7 @@ python = "3.10.*"
 pytorch = "2.1.2"
 tqdm = ">=4.69.0,<5"
 scikit-image = ">=0.25.0,<0.26"
+modelscope = ">=1.37.1,<2"
 # torchvision 和 onnx 移出此处，交由 PyPI 处理
 
 [pypi-dependencies]
