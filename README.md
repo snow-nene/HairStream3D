@@ -44,6 +44,23 @@ cd ../../
   ```
 Code is tested on torch1.9.0, CUDA11.1, Ubuntu 20.04 LTS.
 
+### Optional: Replace U-Net with timm HRNet for strand-map prediction
+
+You can switch the strand predictor backbone with runtime flags:
+
+```
+# random initialization
+python -m scripts.train_hisa --img2strand_backbone hrnet --hrnet_variant hrnet_w18
+
+# ImageNet pretrained initialization
+python -m scripts.train_hisa --img2strand_backbone hrnet --hrnet_variant hrnet_w32 --hrnet_pretrained
+
+# inference with HRNet checkpoint
+python -m scripts.img2strand --img2strand_backbone hrnet --hrnet_variant hrnet_w32 --checkpoint_img2strand ./checkpoints/img2hairstep/hrnet_w32_epoch_xxx.pth
+```
+
+Supported HRNet variants: `hrnet_w18`, `hrnet_w32`, `hrnet_w48`.
+
 ## Single-view 3D Hair Reconstruction
 Put collected and cropped potrait images into ./results/real_imgs/img/. 
 

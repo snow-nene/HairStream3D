@@ -9,7 +9,7 @@ import torch
 import torchvision.transforms as transforms
 
 from tqdm import tqdm
-import imageio
+import imageio.v2 as imageio
 from PIL import Image
 
 from lib.options import BaseOptions

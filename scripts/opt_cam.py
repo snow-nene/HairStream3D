@@ -1,8 +1,8 @@
-import imageio
 import os
 from tqdm import tqdm
 import torch
 
+import imageio.v2 as imageio
 from lib.options import BaseOptions
 from lib.util.opt_lmk import OptLandmark
 from lib.train_util import adjust_learning_rate

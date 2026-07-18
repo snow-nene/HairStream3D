@@ -1,7 +1,6 @@
 import os
 import json
 import torch
-import torch.nn as nn
 from torch.utils.data import DataLoader
 import numpy as np
 from tqdm import tqdm
@@ -9,7 +8,7 @@ from tqdm import tqdm
 # Import the dataset from train_hisa so we don't have to duplicate the logic
 from scripts.train_hisa import HiSaDataset
 from lib.options import BaseOptions
-from lib.model.img2hairstep.UNet import Model
+from lib.model.img2hairstep.model_factory import create_img2strand_model
 
 def test(opt):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -26,7 +25,7 @@ def test(opt):
     test_dataset = HiSaDataset(data_root, test_split)
     test_loader = DataLoader(test_dataset, batch_size=opt.batch_size, shuffle=False, num_workers=opt.num_threads)
     
-    model = Model().to(device)
+    model = create_img2strand_model(opt).to(device)
     
     # Evaluate with the checkpoint specified in options, which is default or the one just saved
     checkpoint_path = opt.checkpoint_img2strand
@@ -37,7 +36,6 @@ def test(opt):
         print(f"Warning: Checkpoint not found at {checkpoint_path}. Evaluating with random weights.")
         
     model.eval()
-    criterion = nn.L1Loss()
     running_loss = 0.0
     
     print(f"Starting evaluation on {len(test_dataset)} test samples...")
@@ -53,8 +51,10 @@ def test(opt):
             # Apply mask
             strand_pred_masked = strand_pred * mask
             strand_gt_masked = strand_gt * mask
-            
-            loss = criterion(strand_pred_masked, strand_gt_masked)
+
+            abs_err = torch.abs(strand_pred_masked - strand_gt_masked).sum()
+            valid = (mask.sum() * strand_pred.shape[1]).clamp_min(1.0)
+            loss = abs_err / valid
             running_loss += loss.item()
             
             pbar.set_postfix({'loss': loss.item()})

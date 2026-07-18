@@ -86,6 +86,16 @@ class BaseOptions():
                              help='# of dimensions of mlp')
         g_model.add_argument('--use_tanh', action='store_true',
                              help='using tanh after last conv of image_filter network')
+        g_model.add_argument('--img2strand_backbone', type=str, default='unet',
+                     choices=['unet', 'hrnet'],
+                     help='Backbone for strand-map prediction.')
+        g_model.add_argument('--hrnet_variant', type=str, default='hrnet_w32',
+                     choices=['hrnet_w18', 'hrnet_w32', 'hrnet_w48'],
+                     help='HRNet variant from timm when img2strand_backbone=hrnet.')
+        g_model.add_argument('--hrnet_pretrained', action='store_true',
+                     help='Use ImageNet pretrained timm HRNet weights.')
+        g_model.add_argument('--hrnet_decoder_channels', type=int, default=128,
+                     help='Decoder channels for HRNet fusion head.')
 
         # for train
         parser.add_argument('--finetune', action='store_true', help='if generate orientation')

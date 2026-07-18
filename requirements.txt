@@ -17,3 +17,4 @@ gradio==2.9.4
 open3d==0.13.0
 trimesh==3.9.36
 # rtree==1.0.0
+timm==0.4.12

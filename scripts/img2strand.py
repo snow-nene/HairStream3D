@@ -1,15 +1,16 @@
 import torch
 import numpy as np
-import imageio
+import imageio.v2 as imageio
 from torch.autograd import Variable
 import os
 from tqdm import tqdm
 
 from lib.options import BaseOptions
-from lib.model.img2hairstep.UNet import Model
+from lib.model.img2hairstep.model_factory import create_img2strand_model
 
 def img2strand(opt):
     print("convert image to strand map")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     resized_path = os.path.join(opt.root_real_imgs, 'resized_img')
     output_seg_path = os.path.join(opt.root_real_imgs, 'seg')
     output_body_path = os.path.join(opt.root_real_imgs, 'body_img')
@@ -19,8 +20,8 @@ def img2strand(opt):
 
     items = os.listdir(resized_path)
 
-    model = Model().cuda()
-    model.load_state_dict(torch.load(opt.checkpoint_img2strand))
+    model = create_img2strand_model(opt).to(device)
+    model.load_state_dict(torch.load(opt.checkpoint_img2strand, map_location=device))
 
     model.eval()
 
@@ -31,7 +32,7 @@ def img2strand(opt):
 
         rgb_img = rgb_img*mask
 
-        rgb_img = Variable(torch.from_numpy(rgb_img).permute(2, 0, 1).float().unsqueeze(0)).cuda()
+        rgb_img = Variable(torch.from_numpy(rgb_img).permute(2, 0, 1).float().unsqueeze(0)).to(device)
 
         strand_pred = model(rgb_img)
         strand_pred = np.clip(strand_pred.permute(0, 2, 3, 1)[0].cpu().detach().numpy(), 0., 1.)  # 512 * 512 *60
