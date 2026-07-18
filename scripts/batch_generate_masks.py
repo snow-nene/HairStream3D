@@ -71,6 +71,7 @@ def main():
 
     os.makedirs(os.path.join(args.output_dir, 'img'), exist_ok=True)
     os.makedirs(os.path.join(args.output_dir, 'seg'), exist_ok=True)
+    os.makedirs(os.path.join(args.output_dir, 'hair'), exist_ok=True)
 
     # ── 加载 SAM ──
     print(f"Loading SAM ({args.model_type_sam}) from {args.checkpoint_sam} ...")
@@ -99,13 +100,16 @@ def main():
         h = file_hash(img_path)
         out_img_path = os.path.join(args.output_dir, 'img', f'{h}.png')
         out_seg_path = os.path.join(args.output_dir, 'seg', f'{h}.png')
+        out_hair_path = os.path.join(args.output_dir, 'hair', f'{h}.png')
 
-        # 如果已存在则跳过
-        if os.path.exists(out_img_path) and os.path.exists(out_seg_path):
+        # 如果三份都已存在则跳过
+        if (os.path.exists(out_img_path) and
+                os.path.exists(out_seg_path) and
+                os.path.exists(out_hair_path)):
             success += 1
             continue
 
-        # 保存 resized 图片
+        # 保存 resized 全图
         cv2.imwrite(out_img_path, resized)
 
         # SAM 推理
@@ -134,16 +138,25 @@ def main():
             multimask_output=False,
         )
 
-        # 保存 mask
+        # 解析为二值 mask (H, W) 0/255
         if hair_masks.shape[0] == 3 and hair_masks.ndim == 3:
             mask_2d = hair_masks.transpose(1, 2, 0)
-            mask_bin = ((mask_2d[:, :, 0] + mask_2d[:, :, 1] + mask_2d[:, :, 2]) > 0).astype(np.uint8) * 255
+            mask_bin_3c = ((mask_2d[:, :, 0] + mask_2d[:, :, 1] + mask_2d[:, :, 2]) > 0)
         elif hair_masks.ndim == 3 and hair_masks.shape[0] == 1:
-            mask_bin = (hair_masks[0] > 0).astype(np.uint8) * 255
+            mask_bin_3c = (hair_masks[0] > 0)
         else:
-            mask_bin = (hair_masks > 0).astype(np.uint8) * 255
+            mask_bin_3c = (hair_masks > 0)
 
+        mask_bin = (mask_bin_3c.astype(np.uint8) * 255)
+
+        # ── 保存 mask ──
         cv2.imwrite(out_seg_path, mask_bin)
+
+        # ── 保存抠出的头发（RGB × mask，黑色背景）──
+        mask_float = (mask_bin / 255.0)[:, :, None]
+        hair_only = (resized.astype(np.float32) * mask_float).astype(np.uint8)
+        cv2.imwrite(out_hair_path, hair_only)
+
         success += 1
 
     print(f"\nDone: {success} succeeded, {skipped} skipped/failed")
