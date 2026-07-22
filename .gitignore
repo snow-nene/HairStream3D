@@ -127,7 +127,7 @@ dmypy.json
 # Pyre type checker
 .pyre/
 
-# 
+#
 checkpoints/
 external/
 # results/# pixi environments
@@ -135,3 +135,4 @@ external/
 !.pixi/config.toml
 results/
 datasets/
+test*/
