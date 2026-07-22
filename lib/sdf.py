@@ -32,6 +32,7 @@ def batch_eval(points, eval_func, num_samples=512 * 512 * 512):
     sdf = np.zeros(num_pts)
 
     num_batches = num_pts // num_samples
+    print(f'  batch_eval num_batches: {num_batches}, num_pts: {num_pts}')
     for i in range(num_batches):
         sdf[i * num_samples:i * num_samples + num_samples] = eval_func(
             points[:, i * num_samples:i * num_samples + num_samples])
@@ -61,6 +62,7 @@ def eval_grid_octree(coords, eval_func,
     reso = resolution[0] // init_resolution
 
     while reso > 0:
+        print(f'eval_grid_octree loop start: reso={reso}')
         # subdivide the grid
         grid_mask[0:resolution[0]:reso, 0:resolution[1]:reso, 0:resolution[2]:reso] = True
         # test samples in this iteration
@@ -68,7 +70,9 @@ def eval_grid_octree(coords, eval_func,
         #print('step size:', reso, 'test sample size:', test_mask.sum())
         points = coords[:, test_mask]
 
+        print(f'  Calling batch_eval for {test_mask.sum()} samples...')
         sdf[test_mask] = batch_eval(points, eval_func, num_samples=num_samples)
+        print('  batch_eval finished.')
         dirty[test_mask] = False
 
         # do interpolation

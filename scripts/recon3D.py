@@ -131,7 +131,11 @@ def recon3D_from_hairstep(opt):
             test_data = {'hairstep': hairstep, 'calib':calib}
 
             gen_mesh_real(opt, occ_net, cuda, test_data, mesh_path)
-            export_hair_real(orien_net, cuda, test_data, mesh_path, hair3D_path)
+            if os.path.exists(mesh_path):
+                export_hair_real(orien_net, cuda, test_data, mesh_path, hair3D_path)
+            else:
+                print(f"Skipping hair export for {item} because mesh generation failed or was empty.")
+
 
 if __name__ == '__main__':
     opt = BaseOptions().parse()

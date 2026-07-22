@@ -37,33 +37,48 @@ def reconstruction(net, cuda, calib_tensor,
 
     # Then we evaluate the grid
     if use_octree:
+        print(f'Starting octree eval_grid_octree... num_samples={num_samples}')
         sdf = eval_grid_octree(coords, eval_func, num_samples=num_samples)
+        print('eval_grid_octree finished.')
     else:
+        print(f'Starting eval_grid... num_samples={num_samples}')
         sdf = eval_grid(coords, eval_func, num_samples=num_samples)
+        print('eval_grid finished.')
 
     # Finally we do marching cubes
     try:
-        verts, faces, normals, values = measure.marching_cubes_lewiner(sdf, 0.5)
+        if hasattr(measure, 'marching_cubes'):
+            verts, faces, normals, values = measure.marching_cubes(sdf, 0.5)
+        else:
+            verts, faces, normals, values = measure.marching_cubes_lewiner(sdf, 0.5)
         # transform verts into world coordinate system
         verts = np.matmul(mat[:3, :3], verts.T) + mat[:3, 3:4]
         verts = verts.T
         return verts, faces, normals, values
-    except:
-        print('error cannot marching cubes')
-        return -1
+    except Exception as e:
+        print('error cannot marching cubes:', e)
+        return None, None, None, None
     
 def gen_mesh_real(opt, net, cuda, data, save_path, use_octree=True):
     image_tensor = data['hairstep'].to(device=cuda).unsqueeze(0)
     calib_tensor = data['calib'].to(device=cuda).unsqueeze(0)
 
+    print('Evaluating filter pass for occ_net...')
     net.filter(image_tensor)
+    print('Filter pass finished.')
 
     b_min = np.array([-0.3, 1.0, -0.3])
     b_max = np.array([0.3, 2.0, 0.3])
     try:
-        verts, faces, _, _ = reconstruction(
+        print('Running reconstruction...')
+        res = reconstruction(
             net, cuda, calib_tensor, opt.resolution, b_min, b_max, use_octree=use_octree)
-        save_obj_mesh(save_path, verts, faces)
+        print('Reconstruction returned.')
+        if res[0] is not None:
+            verts, faces, _, _ = res
+            save_obj_mesh(save_path, verts, faces)
+        else:
+            print('Reconstruction returned empty mesh.')
     except Exception as e:
         print(e)
         print('Can not create marching cubes at this time.')

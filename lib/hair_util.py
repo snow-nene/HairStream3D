@@ -70,6 +70,18 @@ def save_strands_with_mesh(strands, mesh_path, outputpath, err=0.3, is_eval=Fals
     lines = []
     sline = 0
 
+    print("Batch computing mesh.contains for all strands using Open3D RaycastingScene...")
+    o3d_mesh = o3d.t.geometry.TriangleMesh()
+    o3d_mesh.vertex.positions = o3d.core.Tensor(mesh.vertices, o3d.core.float32)
+    o3d_mesh.triangle.indices = o3d.core.Tensor(mesh.faces, o3d.core.int32)
+    scene = o3d.t.geometry.RaycastingScene()
+    scene.add_triangles(o3d_mesh)
+    
+    queries = o3d.core.Tensor(strands.reshape(-1, 3), o3d.core.float32)
+    occupancy = scene.compute_occupancy(queries)
+    all_pts_in_out = occupancy.numpy().astype(bool).reshape(strands.shape[0], strands.shape[1])
+    print("Batch compute finished.")
+
     for i in range(strands.shape[0]):
         current_pc_all_valid = []
         first_step = strands[i,0] - strands[i,1]
@@ -79,8 +91,8 @@ def save_strands_with_mesh(strands, mesh_path, outputpath, err=0.3, is_eval=Fals
         num_pt = 2
         current_pc_all_valid.append(strands[i][0])
         current_pc_all_valid.append(strands[i][1])
-
-        pts_in_out = mesh.contains(strands[i])
+        
+        pts_in_out = all_pts_in_out[i]
 
         for j in range(2,strands.shape[1]):
             if pts_in_out[j]:
@@ -114,7 +126,12 @@ def export_hair_real(net, cuda, data, mesh_path, save_path):
     calib_tensor = data['calib'].to(device=cuda).unsqueeze(0)
     root_tensor = torch.from_numpy(get_hair_root()).to(device=cuda).float().unsqueeze(0)
 
+    print('Evaluating filter pass for orien_net...')
     net.filter(image_tensor)
 
+    print('Starting hair synthesis...')
     strands = hair_synthesis(net, cuda, root_tensor, calib_tensor, num_sample=100, hair_unit=0.006)
+    print('Hair synthesis finished.')
+    print('Starting save_strands_with_mesh...')
     save_strands_with_mesh(strands, mesh_path, save_path, 0.3)
+    print('save_strands_with_mesh finished.')
