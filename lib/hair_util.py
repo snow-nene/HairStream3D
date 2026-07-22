@@ -135,3 +135,32 @@ def export_hair_real(net, cuda, data, mesh_path, save_path):
     print('Starting save_strands_with_mesh...')
     save_strands_with_mesh(strands, mesh_path, save_path, 0.3)
     print('save_strands_with_mesh finished.')
+
+def export_hair_strategy(strategy, cuda, data, mesh_path, save_path,
+                         num_sample=100, hair_unit=0.006):
+    """
+    Strategy-pattern version of export_hair_real.
+    Works with any BaseReconStrategy (NeuralPIFuStrategy or LaplacePDEStrategy).
+
+    Assumes strategy.filter(data) has already been called.
+
+    Args:
+        strategy:   BaseReconStrategy instance
+        cuda:       torch.device
+        data:       dict with 'hairstep' [4,H,W] and 'calib' [4,4]
+        mesh_path:  path to the coarse hair mesh .obj (used to clip strands)
+        save_path:  output .ply path for 3D hair strands
+        num_sample: number of integration steps per strand (default 100)
+        hair_unit:  step size per integration step in world units (default 0.006)
+    """
+    calib_tensor = data['calib'].to(device=cuda).unsqueeze(0)   # [1, 4, 4]
+    root_tensor  = torch.from_numpy(get_hair_root()).to(device=cuda).float().unsqueeze(0)
+
+    # Switch to orientation query mode
+    strategy.set_query_mode('orien')
+
+    strands = hair_synthesis(strategy, cuda, root_tensor, calib_tensor,
+                             num_sample=num_sample, hair_unit=hair_unit)
+    print('Starting save_strands_with_mesh...')
+    save_strands_with_mesh(strands, mesh_path, save_path, 0.3)
+    print('save_strands_with_mesh finished.')

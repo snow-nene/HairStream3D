@@ -83,6 +83,42 @@ def gen_mesh_real(opt, net, cuda, data, save_path, use_octree=True):
         print(e)
         print('Can not create marching cubes at this time.')
 
+
+def gen_mesh_strategy(opt, strategy, cuda, data, save_path, use_octree=True):
+    """
+    Strategy-pattern version of gen_mesh_real.
+    Works with any BaseReconStrategy implementation (neural or Laplace PDE).
+
+    The strategy must already have been initialized via strategy.filter(data)
+    before this function is called (or filter_once=True will call it).
+
+    Args:
+        opt:       BaseOptions namespace
+        strategy:  BaseReconStrategy instance (NeuralPIFuStrategy or LaplacePDEStrategy)
+        cuda:      torch.device
+        data:      dict with 'hairstep' [4,H,W] and 'calib' [4,4] tensors
+        save_path: output .obj path
+        use_octree: (only relevant for neural strategy; ignored by Laplace)
+    """
+    calib_tensor = data['calib'].to(device=cuda).unsqueeze(0)  # [1, 4, 4]
+
+    # Switch strategy to occupancy query mode
+    strategy.set_query_mode('occ')
+
+    b_min = np.array([-0.3, 1.0, -0.3])
+    b_max = np.array([0.3, 2.0, 0.3])
+    try:
+        res = reconstruction(
+            strategy, cuda, calib_tensor, opt.resolution, b_min, b_max, use_octree=use_octree)
+        if res[0] is not None:
+            verts, faces, _, _ = res
+            save_obj_mesh(save_path, verts, faces)
+        else:
+            print('gen_mesh_strategy: Reconstruction returned empty mesh.')
+    except Exception as e:
+        print(e)
+        print('gen_mesh_strategy: Can not create marching cubes at this time.')
+
 def save_obj_mesh(mesh_path, verts, faces):
     file = open(mesh_path, 'w')
 

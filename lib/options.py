@@ -118,9 +118,45 @@ class BaseOptions():
                             help='Decrease learning rate at these epochs.')
         parser.add_argument('--gamma', type=float, default=0.1, help='LR is multiplied by gamma on schedule.')
 
+        # ---------------------------------------------------------------
+        # Reconstruction strategy selection (scripts/recon3D_strategy.py)
+        # ---------------------------------------------------------------
+        g_recon = parser.add_argument_group('Reconstruction Strategy')
+        g_recon.add_argument(
+            '--recon_strategy', type=str, default='neural',
+            choices=['neural', 'laplace'],
+            help=(
+                'Which 3D reconstruction backend to use. '
+                '"neural" = original HairStep NeuralHDHair* (PIFu neural network, requires pretrained weights). '
+                '"laplace" = training-free Laplace PDE physical field solver (no weights needed).'
+            )
+        )
+        # Laplace PDE tuning parameters
+        g_recon.add_argument(
+            '--pde_resolution', type=int, default=64,
+            help='Voxel grid resolution for Laplace PDE solve (NxNxN). Higher = slower but more detail.'
+        )
+        g_recon.add_argument(
+            '--pde_dilation_iters', type=int, default=6,
+            help='Number of morphological dilation iterations to thicken the hair volume in Laplace PDE.'
+        )
+        g_recon.add_argument(
+            '--pde_cg_tol', type=float, default=1e-4,
+            help='Conjugate Gradient solver convergence tolerance for Laplace PDE.'
+        )
+        g_recon.add_argument(
+            '--pde_cg_maxiter', type=int, default=500,
+            help='Maximum CG iterations for Laplace PDE solver.'
+        )
+        g_recon.add_argument(
+            '--pde_anisotropy', type=float, default=0.8,
+            help='Anisotropy weight for guided Laplace PDE [0=isotropic, 1=fully strand-guided].'
+        )
+
         # special tasks
         self.initialized = True
         return parser
+
 
     def gather_options(self):
         # initialize parser with basic options
