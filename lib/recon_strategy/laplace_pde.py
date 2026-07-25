@@ -90,7 +90,7 @@ class LaplacePDEStrategy(BaseReconStrategy):
     # BaseReconStrategy interface
     # ===================================================================
 
-    def filter(self, data: dict) -> None:
+    def filter(self, data: dict, mesh_path: str = None) -> None:
         """
         Builds the 3D occupancy and orientation fields from the 2D hairstep input.
         This replaces the neural network's feature extraction step.
@@ -99,6 +99,7 @@ class LaplacePDEStrategy(BaseReconStrategy):
             data: dict with:
                 'hairstep': [4, H, W] — channels 0-2 strand RGB, channel 3 depth
                 'calib':    [4, 4]    — orthographic calibration matrix
+            mesh_path: Optional path to true 3D mesh volume for PDE boundary.
         """
         self._data = data
         hairstep = data['hairstep'].cpu().numpy()  # [4, H, W]
@@ -106,20 +107,34 @@ class LaplacePDEStrategy(BaseReconStrategy):
         strand_rgb = hairstep[:3]    # [3, H, W] — orientation in [-1, 1]
         depth_map  = hairstep[3]     # [H, W]    — depth (background = -3.0)
 
-        # Derive hair mask: depth > -2.5 means within valid hair region
-        hair_mask = (depth_map > -2.5).astype(np.float32)  # [H, W]
+        # Derive hair mask: new depth format uses 0.0 for background
+        hair_mask = (depth_map > 0.05).astype(np.float32)  # [H, W]
 
         # --- decode 2D strand directions from RGB (undoing normalize) ---
-        # strand_rgb is in [-1, 1]; channels 1 and 2 encode (cos θ, sin θ)
-        strand_dx = strand_rgb[1]  # [H, W]  cos θ
-        strand_dy = strand_rgb[2]  # [H, W]  sin θ
+        # strand_rgb is in [-1, 1]. cv2 reads BGR, so 0=B, 1=G, 2=R
+        # According to the user:
+        # B = (-dx + 1) / 2 * 255 -> B_norm = -dx -> dx = -strand_rgb[0]
+        # G = (dy + 1) / 2 * 255  -> G_norm = dy  -> dy = strand_rgb[1]
+        # However, Image Y (dy) points DOWN, and World Y points UP.
+        # So we MUST invert dy to match World coordinates!
+        strand_dx = -strand_rgb[0] # [H, W]  X direction
+        strand_dy = -strand_rgb[1] # [H, W]  Y direction (inverted for World Up)
+        
+        # Compute depth gradient to estimate surface tangent dz component
+        # Avoid boundary step edges by extrapolating depth or just accepting the gradient 
+        # (the PDE surface voxels might pick up boundary gradients, but let's just mask it).
+        depth_smooth = gaussian_filter(depth_map, sigma=2.0) 
+        dz_dx = np.gradient(depth_smooth, axis=1)  # ∂Z/∂x
+        dz_dy = np.gradient(depth_smooth, axis=0)  # ∂Z/∂y
+        strand_dz = (strand_dx * dz_dx + strand_dy * dz_dy) * hair_mask
 
+        # 2. Build volumes
         print('[LaplacePDEStrategy] Building 3D occupancy volume ...')
-        self._occ_vol = self._build_occupancy_volume(hair_mask, depth_map)
+        self._occ_vol = self._build_occupancy_volume(hair_mask, depth_map, mesh_path=mesh_path)
 
         print('[LaplacePDEStrategy] Solving Laplace orientation field ...')
         self._orien_vol = self._build_orientation_volume(
-            hair_mask, depth_map, strand_dx, strand_dy
+            hair_mask, depth_map, strand_dx, strand_dy, strand_dz, mesh_path=mesh_path
         )
         print('[LaplacePDEStrategy] Field build complete.')
 
@@ -170,7 +185,7 @@ class LaplacePDEStrategy(BaseReconStrategy):
     # ===================================================================
 
     def _build_occupancy_volume(
-        self, hair_mask: np.ndarray, depth_map: np.ndarray
+        self, hair_mask: np.ndarray, depth_map: np.ndarray, mesh_path: str = None
     ) -> np.ndarray:
         """
         Builds a [Rx, Ry, Rz] occupancy volume from the 2D hair mask and depth map.
@@ -218,24 +233,39 @@ class LaplacePDEStrategy(BaseReconStrategy):
         vox_depth  = pts_cam[2]           # [R^3] depth of the voxel itself
         mask_2d    = hair_mask[py, px]    # [R^3] is this pixel inside hair
 
-        # A voxel is occupied if:
-        #   1. The projected pixel is inside the hair silhouette mask
-        #   2. The voxel's depth is >= surface_depth - small margin (inside/on surface)
-        margin = (b_max[2] - b_min[2]) / R * 2.0
-        inside = (mask_2d > 0.5) & (vox_depth >= (surf_depth - margin))
-
-        occ.ravel()[inside] = 1.0
-
-        # Morphological dilation to thicken the volume inward (Z direction)
-        struct = np.ones((1, 1, self.dilation_iters), dtype=bool)
-        occ_bool = occ > 0.5
-        occ_dilated = binary_dilation(occ_bool, structure=struct, iterations=1)
-        occ = occ_dilated.astype(np.float32)
-
-        # Fill interior with uniform dilation along all axes for robustness
-        struct3 = np.ones((3, 3, 3), dtype=bool)
-        for _ in range(max(1, self.dilation_iters // 3)):
-            occ = binary_dilation(occ > 0.5, structure=struct3).astype(np.float32)
+        if mesh_path is not None:
+            import open3d as o3d
+            mesh = o3d.io.read_triangle_mesh(mesh_path)
+            mesh_t = o3d.t.geometry.TriangleMesh.from_legacy(mesh)
+            scene = o3d.t.geometry.RaycastingScene()
+            scene.add_triangles(mesh_t)
+            
+            query_points = o3d.core.Tensor(pts_world.T, dtype=o3d.core.Dtype.Float32)
+            distances = scene.compute_distance(query_points).cpu().numpy()
+            
+            # A shell of 0.05 around the extracted Pixal3D hair mesh covers the true volume
+            inside = (distances < 0.05) & (mask_2d > 0.5)
+            occ.ravel()[inside] = 1.0
+        else:
+            # A voxel is occupied if:
+            #   1. The projected pixel is inside the hair silhouette mask
+            #   2. The voxel's depth is <= surface_depth + small margin (inside/on surface)
+            # In our data, smaller depth means further away (deeper into the head).
+            margin = (b_max[2] - b_min[2]) / R * 2.0
+            inside = (mask_2d > 0.5) & (vox_depth <= (surf_depth + margin))
+    
+            occ.ravel()[inside] = 1.0
+    
+            # Morphological dilation to thicken the volume inward (Z direction)
+            struct = np.ones((1, 1, self.dilation_iters), dtype=bool)
+            occ_bool = occ > 0.5
+            occ_dilated = binary_dilation(occ_bool, structure=struct, iterations=1)
+            occ = occ_dilated.astype(np.float32)
+    
+            # Fill interior with uniform dilation along all axes for robustness
+            struct3 = np.ones((3, 3, 3), dtype=bool)
+            for _ in range(max(1, self.dilation_iters // 3)):
+                occ = binary_dilation(occ > 0.5, structure=struct3).astype(np.float32)
 
         # Gaussian smooth for soft boundary → better Marching Cubes surface
         occ = gaussian_filter(occ, sigma=1.0)
@@ -249,6 +279,8 @@ class LaplacePDEStrategy(BaseReconStrategy):
         depth_map: np.ndarray,
         strand_dx: np.ndarray,
         strand_dy: np.ndarray,
+        strand_dz: np.ndarray,
+        mesh_path: str = None
     ) -> np.ndarray:
         """
         Builds a [3, Rx, Ry, Rz] orientation field by solving the Laplace equation
@@ -269,12 +301,13 @@ class LaplacePDEStrategy(BaseReconStrategy):
         # Step 1: Compute 3D strand directions on visible surface
         # ------------------------------------------------------------------
         # Compute depth gradient to estimate surface tangent dz component
-        depth_smooth = gaussian_filter(depth_map * (depth_map > -2.5), sigma=2.0)
+        depth_smooth = gaussian_filter(depth_map, sigma=2.0)
         dz_dx = np.gradient(depth_smooth, axis=1)  # ∂Z/∂x
         dz_dy = np.gradient(depth_smooth, axis=0)  # ∂Z/∂y
 
         # 3D tangent vector: T = (dx, dy, dx*dz_dx + dy*dz_dy)
-        strand_dz = strand_dx * dz_dx + strand_dy * dz_dy  # [H, W]
+        hair_mask_float = (depth_map > 0.05).astype(np.float32)
+        strand_dz = (strand_dx * dz_dx + strand_dy * dz_dy) * hair_mask_float  # [H, W]
 
         # Normalize the 3D direction vectors
         norm = np.sqrt(strand_dx**2 + strand_dy**2 + strand_dz**2) + 1e-8
@@ -311,8 +344,45 @@ class LaplacePDEStrategy(BaseReconStrategy):
         mask_2d    = hair_mask[py, px]
 
         margin = (b_max[2] - b_min[2]) / R * 2.0
-        is_surface = (mask_2d > 0.5) & (np.abs(vox_depth - surf_depth) < margin)
-        is_hair    = (mask_2d > 0.5) & (vox_depth >= (surf_depth - margin))
+        
+        if mesh_path is not None:
+            import open3d as o3d
+            mesh = o3d.io.read_triangle_mesh(mesh_path)
+            mesh_t = o3d.t.geometry.TriangleMesh.from_legacy(mesh)
+            scene = o3d.t.geometry.RaycastingScene()
+            scene.add_triangles(mesh_t)
+            
+            query_points = o3d.core.Tensor(pts_world.T, dtype=o3d.core.Dtype.Float32)
+            distances = scene.compute_distance(query_points).cpu().numpy()
+            
+            # The surface voxels are those very close to the mesh
+            is_surface = (distances < 0.015) & (mask_2d > 0.5)
+            # The interior voxels are those within the thick shell
+            is_hair = (distances < 0.05) & (mask_2d > 0.5)
+            
+            # Also compute inner boundary (scalp) to push hair outwards
+            head_mesh = o3d.io.read_triangle_mesh('data/head_model.obj')
+            head_t = o3d.t.geometry.TriangleMesh.from_legacy(head_mesh)
+            head_scene = o3d.t.geometry.RaycastingScene()
+            head_scene.add_triangles(head_t)
+            
+            head_sdf = head_scene.compute_signed_distance(query_points).cpu().numpy()
+            is_inner_surface = (np.abs(head_sdf) < 0.015) & is_hair
+            # Exclude inner surface from outer surface
+            is_surface = is_surface & ~is_inner_surface
+            
+            head_sdf_3d = head_sdf.reshape(R, R, R)
+            grad_x = np.gradient(head_sdf_3d, axis=0).ravel()
+            grad_y = np.gradient(head_sdf_3d, axis=1).ravel()
+            grad_z = np.gradient(head_sdf_3d, axis=2).ravel()
+            head_normals = np.stack([grad_x, grad_y, grad_z], axis=1)
+            norms = np.linalg.norm(head_normals, axis=1, keepdims=True) + 1e-8
+            head_normals = head_normals / norms
+            
+        else:
+            is_surface = (mask_2d > 0.5) & (np.abs(vox_depth - surf_depth) < margin)
+            is_hair    = (mask_2d > 0.5) & (vox_depth <= (surf_depth + margin))
+            is_inner_surface = np.zeros_like(is_surface, dtype=bool)
 
         # ------------------------------------------------------------------
         # Step 3: Build the Laplace linear system and solve per component
@@ -325,67 +395,91 @@ class LaplacePDEStrategy(BaseReconStrategy):
 
         orien_vol = np.zeros((3, R, R, R), dtype=np.float32)
 
-        for comp_idx, (bc_vals_2d, comp_name) in enumerate([
-            (strand_vx, 'Vx'),
-            (strand_vy, 'Vy'),
-            (strand_vz, 'Vz'),
-        ]):
-            print(f'  [Laplace] Solving component {comp_name} ({R}^3 grid) ...', end=' ')
+        # Build sparse matrix A and rhs b for ∇²u = 0
+        A = lil_matrix((N, N), dtype=np.float32)
+        b_rhs = np.zeros((N, 3), dtype=np.float32)
 
-            # Boundary values for surface voxels
-            bc_surf = bc_vals_2d[py, px]  # [R^3] — value at each voxel's pixel
+        # Index helpers
+        idx = np.arange(R, dtype=np.int32)
+        ix3, iy3, iz3 = np.meshgrid(idx, idx, idx, indexing='ij')
+        flat_idx = (ix3 * stride_x + iy3 * stride_y + iz3 * stride_z).ravel()  # [N]
 
-            # Build sparse matrix A and rhs b for ∇²u = 0
-            A = lil_matrix((N, N), dtype=np.float32)
-            b_rhs = np.zeros(N, dtype=np.float32)
+        is_surface_vol = is_surface  # [N] boolean
+        is_inner_vol = is_inner_surface
+        is_interior    = is_hair & ~is_surface & ~is_inner_surface  # [N]
 
-            # Index helpers
-            idx = np.arange(R, dtype=np.int32)
-            ix3, iy3, iz3 = np.meshgrid(idx, idx, idx, indexing='ij')
-            flat_idx = (ix3 * stride_x + iy3 * stride_y + iz3 * stride_z).ravel()  # [N]
-
-            is_surface_vol = is_surface  # [N] boolean
-            is_interior    = is_hair & ~is_surface  # [N]
-
-            # For surface voxels: u = bc value (Dirichlet)
-            surf_flat = flat_idx[is_surface_vol]
-            for fi, bval in zip(surf_flat, bc_surf[is_surface_vol]):
+        # For outer surface voxels: u = 2D flow (Dirichlet)
+        surf_flat = flat_idx[is_surface_vol]
+        for fi in surf_flat:
+            A[fi, fi] = 1.0
+        
+        b_rhs[surf_flat, 0] = strand_dx[py[is_surface_vol], px[is_surface_vol]]
+        b_rhs[surf_flat, 1] = strand_dy[py[is_surface_vol], px[is_surface_vol]]
+        b_rhs[surf_flat, 2] = strand_dz[py[is_surface_vol], px[is_surface_vol]]
+        
+        # For inner surface voxels (scalp): u = outward normal (Dirichlet)
+        inner_flat = flat_idx[is_inner_vol]
+        if len(inner_flat) > 0:
+            for fi in inner_flat:
                 A[fi, fi] = 1.0
-                b_rhs[fi] = float(bval)
+            
+            # Blend 70% outward normal with 30% 2D flow to maintain styling direction
+            b_rhs[inner_flat, 0] = 0.7 * head_normals[is_inner_vol, 0] + 0.3 * strand_dx[py[is_inner_vol], px[is_inner_vol]]
+            b_rhs[inner_flat, 1] = 0.7 * head_normals[is_inner_vol, 1] + 0.3 * strand_dy[py[is_inner_vol], px[is_inner_vol]]
+            b_rhs[inner_flat, 2] = 0.7 * head_normals[is_inner_vol, 2] + 0.3 * strand_dz[py[is_inner_vol], px[is_inner_vol]]
 
-            # For interior hair voxels: ∇²u = 0  (6-neighbor finite difference)
-            interior_ixs = ix3.ravel()[is_interior]
-            interior_iys = iy3.ravel()[is_interior]
-            interior_izs = iz3.ravel()[is_interior]
+        # For interior hair voxels: ∇²u = 0  (6-neighbor finite difference)
+        interior_ixs = ix3.ravel()[is_interior]
+        interior_iys = iy3.ravel()[is_interior]
+        interior_izs = iz3.ravel()[is_interior]
 
-            for ix, iy, iz in zip(interior_ixs, interior_iys, interior_izs):
-                fi = int(ix * stride_x + iy * stride_y + iz * stride_z)
-                neighbors = 0
-                for dx, dy, dz in [
-                    (1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1)
-                ]:
-                    nx, ny, nz = ix+dx, iy+dy, iz+dz
-                    if 0 <= nx < R and 0 <= ny < R and 0 <= nz < R:
-                        A[fi, int(nx*stride_x + ny*stride_y + nz*stride_z)] = 1.0
-                        neighbors += 1
-                A[fi, fi] = -neighbors
+        for ix, iy, iz in zip(interior_ixs, interior_iys, interior_izs):
+            fi = int(ix * stride_x + iy * stride_y + iz * stride_z)
+            neighbors = 0
+            for dx, dy, dz in [
+                (1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1)
+            ]:
+                nx, ny, nz = ix+dx, iy+dy, iz+dz
+                if 0 <= nx < R and 0 <= ny < R and 0 <= nz < R:
+                    A[fi, int(nx*stride_x + ny*stride_y + nz*stride_z)] = 1.0
+                    neighbors += 1
+            A[fi, fi] = -neighbors
 
-            # For outside voxels: u = 0 (Dirichlet zero — no hair)
-            is_outside = ~is_hair
-            outside_flat = flat_idx[is_outside]
-            for fi in outside_flat:
-                A[fi, fi] = 1.0
-                b_rhs[fi] = 0.0
+        # For outside voxels: u = 0 (Dirichlet zero — no hair)
+        is_outside = ~is_hair
+        outside_flat = flat_idx[is_outside]
+        for fi in outside_flat:
+            A[fi, fi] = 1.0
+            b_rhs[fi] = 0.0
 
-            # Solve using Conjugate Gradient
-            A_csr = csr_matrix(A)
-            u, info = cg(A_csr, b_rhs, tol=self.cg_tol, maxiter=self.cg_maxiter)
-            if info != 0:
-                print(f'  [Laplace] Warning: CG did not converge (info={info})')
-            else:
-                print('done.')
+        A = A.tocsr()
+        # We use bicgstab since the matrix is technically asymmetric due to the 
+        # direct insertion of Dirichlet boundary equations A[b, b] = 1.
+        from scipy.sparse.linalg import gmres
 
-            orien_vol[comp_idx] = u.reshape(R, R, R).astype(np.float32)
+        print(f'  [Laplace] Solving component Vx ({R}^3 grid) ...', end=' ', flush=True)
+        vx, info_x = gmres(A, b_rhs[:, 0], rtol=self.cg_tol, maxiter=self.cg_maxiter)
+        if info_x != 0:
+            print(f'  [Laplace] Warning: gmres did not converge (info={info_x})')
+        else:
+            print('done.')
+        orien_vol[0] = vx.reshape(R, R, R).astype(np.float32)
+
+        print(f'  [Laplace] Solving component Vy ({R}^3 grid) ...', end=' ', flush=True)
+        vy, info_y = gmres(A, b_rhs[:, 1], rtol=self.cg_tol, maxiter=self.cg_maxiter)
+        if info_y != 0:
+            print(f'  [Laplace] Warning: gmres did not converge (info={info_y})')
+        else:
+            print('done.')
+        orien_vol[1] = vy.reshape(R, R, R).astype(np.float32)
+
+        print(f'  [Laplace] Solving component Vz ({R}^3 grid) ...', end=' ', flush=True)
+        vz, info_z = gmres(A, b_rhs[:, 2], rtol=self.cg_tol, maxiter=self.cg_maxiter)
+        if info_z != 0:
+            print(f'  [Laplace] Warning: gmres did not converge (info={info_z})')
+        else:
+            print('done.')
+        orien_vol[2] = vz.reshape(R, R, R).astype(np.float32)
 
         # ------------------------------------------------------------------
         # Step 4: Normalize orientation vectors
@@ -404,8 +498,8 @@ class LaplacePDEStrategy(BaseReconStrategy):
         Convert world-space coordinates [B, 3, N] to voxel grid UV in [-1, 1].
         Voxel grid spans [b_min, b_max] in world space.
         """
-        b_min = torch.tensor(self.b_min, dtype=torch.float32)
-        b_max = torch.tensor(self.b_max, dtype=torch.float32)
+        b_min = torch.tensor(self.b_min, dtype=torch.float32, device=points.device)
+        b_max = torch.tensor(self.b_max, dtype=torch.float32, device=points.device)
 
         # Normalize to [0, 1] then shift to [-1, 1] for grid_sample
         uv = (points - b_min[None, :, None]) / (b_max - b_min)[None, :, None]

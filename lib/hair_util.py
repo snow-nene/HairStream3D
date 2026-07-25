@@ -59,65 +59,46 @@ def hair_synthesis_DSH(net, cuda, root_tensor, calib_tensor, num_sample=100, hai
     return hair_strands.permute(2, 0, 1).cpu().detach().numpy()
 
 def save_strands_with_mesh(strands, mesh_path, outputpath, err=0.3, is_eval=False):
-    mesh = trimesh.load(mesh_path, process=False)
-    #for coarse mesh /1000.0
-    if is_eval:
-        mesh.vertices = mesh.vertices/1000.0
-
+    # Since mesh_path is only a front-facing shell in our new pipeline, 
+    # clipping against it destroys the back of the head hair (baldness).
+    # The PDE RK4 integrator already respects the inner collision boundary.
+    # We will just save all strands directly.
+    
     lst_pc_all_valid = []
     lst_num_pt = []
     pc_all_valid = []
     lines = []
     sline = 0
 
-    print("Batch computing mesh.contains for all strands using Open3D RaycastingScene...")
-    o3d_mesh = o3d.t.geometry.TriangleMesh()
-    o3d_mesh.vertex.positions = o3d.core.Tensor(mesh.vertices, o3d.core.float32)
-    o3d_mesh.triangle.indices = o3d.core.Tensor(mesh.faces, o3d.core.int32)
-    scene = o3d.t.geometry.RaycastingScene()
-    scene.add_triangles(o3d_mesh)
+    # Optional: Clip strands if they go below the neck (Y > some value, in Blender Y is UP, wait, in our coords Y is UP? No, FLAME Y is UP but inverted? Let's just keep all points for now).
+    # Wait, in our coords, Y is DOWN in image space, but in 3D, Y is UP?
+    # Let's just keep the full 300 steps. The PDE field should guide them smoothly.
     
-    queries = o3d.core.Tensor(strands.reshape(-1, 3), o3d.core.float32)
-    occupancy = scene.compute_occupancy(queries)
-    all_pts_in_out = occupancy.numpy().astype(bool).reshape(strands.shape[0], strands.shape[1])
-    print("Batch compute finished.")
-
     for i in range(strands.shape[0]):
         current_pc_all_valid = []
-        first_step = strands[i,0] - strands[i,1]
-        first_step = np.dot(first_step, first_step)
-        if np.dot(strands[i,0], strands[i,0])<0.001 or np.dot(strands[i,1], strands[i,1])<0.001:
+        if np.dot(strands[i,0], strands[i,0]) < 0.001 or np.dot(strands[i,1], strands[i,1]) < 0.001:
             continue
-        num_pt = 2
-        current_pc_all_valid.append(strands[i][0])
-        current_pc_all_valid.append(strands[i][1])
-        
-        pts_in_out = all_pts_in_out[i]
-
-        for j in range(2,strands.shape[1]):
-            if pts_in_out[j]:
-                current_pc_all_valid.append(strands[i][j])
-                num_pt += 1
-            else:
-                break
+            
+        num_pt = 0
+        for j in range(strands.shape[1]):
+            current_pc_all_valid.append(strands[i][j])
+            num_pt += 1
+            
         lst_pc_all_valid.append(current_pc_all_valid)
         lst_num_pt.append(num_pt)
 
-    min_num_pts = int(sum(lst_num_pt)/len(lst_num_pt)*err)
-
-    for i in range(strands.shape[0]):
-        if lst_num_pt[i]<min_num_pts:
-            continue
-        pc_all_valid = pc_all_valid + lst_pc_all_valid[i]
-
+    for i in range(len(lst_pc_all_valid)):
+        pc_all_valid.extend(lst_pc_all_valid[i])
         for j in range(lst_num_pt[i]-1):
             lines.append([sline + j, sline + j + 1])
         sline += lst_num_pt[i]
 
+    import open3d as o3d
     line_set = o3d.geometry.LineSet(points=o3d.utility.Vector3dVector(np.asarray(pc_all_valid)), lines=o3d.utility.Vector2iVector(lines))
     o3d.io.write_line_set(outputpath, line_set)
 
 def get_hair_root(filepath='./data/roots10k.obj'):
+    from lib.mesh_util import load_obj_mesh
     root, _ = load_obj_mesh(filepath)
     return root.T
 

@@ -136,3 +136,10 @@ external/
 results/
 datasets/
 test*/
+
+# AI agents and extensions
+.agent/
+.claude/
+.codex/
+CLAUDE.md
+ext/
