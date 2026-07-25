@@ -157,7 +157,7 @@ def main():
     print("Integrating with RK4...")
     strands = hair_synthesis_rk4(
         strategy, cuda, root_tensor, calib_tensor, 
-        num_sample=300, hair_unit=0.006,
+        num_sample=100, hair_unit=0.006,
         sdf_vol=sdf_vol, normal_vol=normal_vol, b_min_t=b_min_t, b_max_t=b_max_t
     )
     

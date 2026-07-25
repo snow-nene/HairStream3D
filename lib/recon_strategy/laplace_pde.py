@@ -367,7 +367,10 @@ class LaplacePDEStrategy(BaseReconStrategy):
             head_scene.add_triangles(head_t)
             
             head_sdf = head_scene.compute_signed_distance(query_points).cpu().numpy()
-            is_inner_surface = (np.abs(head_sdf) < 0.015) & is_hair
+            # Restrict inner normal (outward puffiness) to the front of the head (Z > 0)
+            # For the back of the head (or outside 2D mask), we want it to extrapolate adjacent flow and cling to scalp.
+            is_front_vol = (pts_world[2] > 0.0)
+            is_inner_surface = (np.abs(head_sdf) < 0.015) & is_hair & is_front_vol
             # Exclude inner surface from outer surface
             is_surface = is_surface & ~is_inner_surface
             
@@ -415,7 +418,7 @@ class LaplacePDEStrategy(BaseReconStrategy):
         
         b_rhs[surf_flat, 0] = strand_dx[py[is_surface_vol], px[is_surface_vol]]
         b_rhs[surf_flat, 1] = strand_dy[py[is_surface_vol], px[is_surface_vol]]
-        b_rhs[surf_flat, 2] = strand_dz[py[is_surface_vol], px[is_surface_vol]]
+        b_rhs[surf_flat, 2] = strand_dz[py[is_surface_vol], px[is_surface_vol]]  # slight backward slant
         
         # For inner surface voxels (scalp): u = outward normal (Dirichlet)
         inner_flat = flat_idx[is_inner_vol]
