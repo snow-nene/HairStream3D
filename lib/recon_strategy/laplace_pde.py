@@ -388,109 +388,97 @@ class LaplacePDEStrategy(BaseReconStrategy):
             is_inner_surface = np.zeros_like(is_surface, dtype=bool)
 
         # ------------------------------------------------------------------
-        # Step 3: Build the Laplace linear system and solve per component
+        # Step 3: Build the Laplace linear system and solve per component (Matrix-Free GPU)
         # ------------------------------------------------------------------
-        N = R * R * R
-        # Strides for converting (ix, iy, iz) <-> flat index
-        stride_x = R * R
-        stride_y = R
-        stride_z = 1
-
-        orien_vol = np.zeros((3, R, R, R), dtype=np.float32)
-
-        # Build sparse matrix A and rhs b for ∇²u = 0
-        A = lil_matrix((N, N), dtype=np.float32)
-        b_rhs = np.zeros((N, 3), dtype=np.float32)
-
-        # Index helpers
-        idx = np.arange(R, dtype=np.int32)
-        ix3, iy3, iz3 = np.meshgrid(idx, idx, idx, indexing='ij')
-        flat_idx = (ix3 * stride_x + iy3 * stride_y + iz3 * stride_z).ravel()  # [N]
-
-        is_surface_vol = is_surface  # [N] boolean
-        is_inner_vol = is_inner_surface
-        is_interior    = is_hair & ~is_surface & ~is_inner_surface  # [N]
-
-        # For outer surface voxels: u = 2D flow (Dirichlet)
-        surf_flat = flat_idx[is_surface_vol]
-        for fi in surf_flat:
-            A[fi, fi] = 1.0
+        is_interior = is_hair & ~is_surface & ~is_inner_surface
         
-        b_rhs[surf_flat, 0] = strand_dx[py[is_surface_vol], px[is_surface_vol]]
-        b_rhs[surf_flat, 1] = strand_dy[py[is_surface_vol], px[is_surface_vol]]
-        b_rhs[surf_flat, 2] = strand_dz[py[is_surface_vol], px[is_surface_vol]]  # slight backward slant
+        is_surface_t = torch.from_numpy(is_surface.reshape(R, R, R)).bool().to(self.cuda)
+        is_inner_surface_t = torch.from_numpy(is_inner_surface.reshape(R, R, R)).bool().to(self.cuda)
+        is_interior_t = torch.from_numpy(is_interior.reshape(R, R, R)).bool().to(self.cuda)
         
-        # For inner surface voxels (scalp): u = outward normal (Dirichlet)
-        inner_flat = flat_idx[is_inner_vol]
-        if len(inner_flat) > 0:
-            for fi in inner_flat:
-                A[fi, fi] = 1.0
+        # Prepare boundary values (Dirichlet)
+        b_vol = torch.zeros((3, R, R, R), dtype=torch.float32, device=self.cuda)
+        
+        # Outer surface
+        b_vol[0, is_surface_t] = torch.from_numpy(strand_dx[py[is_surface], px[is_surface]]).float().to(self.cuda)
+        b_vol[1, is_surface_t] = torch.from_numpy(strand_dy[py[is_surface], px[is_surface]]).float().to(self.cuda)
+        b_vol[2, is_surface_t] = torch.from_numpy(strand_dz[py[is_surface], px[is_surface]]).float().to(self.cuda)
+        
+        # Inner surface
+        if is_inner_surface.any():
+            hn = torch.from_numpy(head_normals[is_inner_surface]).float().to(self.cuda)
+            dx_t = torch.from_numpy(strand_dx[py[is_inner_surface], px[is_inner_surface]]).float().to(self.cuda)
+            dy_t = torch.from_numpy(strand_dy[py[is_inner_surface], px[is_inner_surface]]).float().to(self.cuda)
+            dz_t = torch.from_numpy(strand_dz[py[is_inner_surface], px[is_inner_surface]]).float().to(self.cuda)
+            b_vol[0, is_inner_surface_t] = 0.7 * hn[:, 0] + 0.3 * dx_t
+            b_vol[1, is_inner_surface_t] = 0.7 * hn[:, 1] + 0.3 * dy_t
+            b_vol[2, is_inner_surface_t] = 0.7 * hn[:, 2] + 0.3 * dz_t
             
-            # Blend 70% outward normal with 30% 2D flow to maintain styling direction
-            b_rhs[inner_flat, 0] = 0.7 * head_normals[is_inner_vol, 0] + 0.3 * strand_dx[py[is_inner_vol], px[is_inner_vol]]
-            b_rhs[inner_flat, 1] = 0.7 * head_normals[is_inner_vol, 1] + 0.3 * strand_dy[py[is_inner_vol], px[is_inner_vol]]
-            b_rhs[inner_flat, 2] = 0.7 * head_normals[is_inner_vol, 2] + 0.3 * strand_dz[py[is_inner_vol], px[is_inner_vol]]
-
-        # For interior hair voxels: ∇²u = 0  (6-neighbor finite difference)
-        interior_ixs = ix3.ravel()[is_interior]
-        interior_iys = iy3.ravel()[is_interior]
-        interior_izs = iz3.ravel()[is_interior]
-
-        for ix, iy, iz in zip(interior_ixs, interior_iys, interior_izs):
-            fi = int(ix * stride_x + iy * stride_y + iz * stride_z)
-            neighbors = 0
-            for dx, dy, dz in [
-                (1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1)
-            ]:
-                nx, ny, nz = ix+dx, iy+dy, iz+dz
-                if 0 <= nx < R and 0 <= ny < R and 0 <= nz < R:
-                    A[fi, int(nx*stride_x + ny*stride_y + nz*stride_z)] = 1.0
-                    neighbors += 1
-            A[fi, fi] = -neighbors
-
-        # For outside voxels: u = 0 (Dirichlet zero — no hair)
-        is_outside = ~is_hair
-        outside_flat = flat_idx[is_outside]
-        for fi in outside_flat:
-            A[fi, fi] = 1.0
-            b_rhs[fi] = 0.0
-
-        A = A.tocsr()
-        # We use bicgstab since the matrix is technically asymmetric due to the 
-        # direct insertion of Dirichlet boundary equations A[b, b] = 1.
-        from scipy.sparse.linalg import gmres
-
-        print(f'  [Laplace] Solving component Vx ({R}^3 grid) ...', end=' ', flush=True)
-        vx, info_x = gmres(A, b_rhs[:, 0], rtol=self.cg_tol, maxiter=self.cg_maxiter)
-        if info_x != 0:
-            print(f'  [Laplace] Warning: gmres did not converge (info={info_x})')
+        # Laplacian Kernel for L_int
+        kernel = torch.zeros((1, 1, 3, 3, 3), dtype=torch.float32, device=self.cuda)
+        kernel[0, 0, 1, 1, 1] = 6.0
+        kernel[0, 0, 0, 1, 1] = -1.0; kernel[0, 0, 2, 1, 1] = -1.0
+        kernel[0, 0, 1, 0, 1] = -1.0; kernel[0, 0, 1, 2, 1] = -1.0
+        kernel[0, 0, 1, 1, 0] = -1.0; kernel[0, 0, 1, 1, 2] = -1.0
+        
+        def apply_L(x):
+            # x is [3, R, R, R]
+            x_in = x.unsqueeze(1) # [3, 1, R, R, R]
+            out = torch.nn.functional.conv3d(x_in, kernel, padding=1)
+            out = out.squeeze(1) # [3, R, R, R]
+            out[:, ~is_interior_t] = 0.0 # Only defined on interior
+            return out
+            
+        print(f'  [Laplace] Solving Matrix-Free CG ({R}^3 grid) on GPU...', end=' ', flush=True)
+        
+        # Initial guess x = 0
+        x = torch.zeros_like(b_vol)
+        
+        # RHS = \sum_{neighbors} b_vol for interior nodes
+        neighbor_kernel = -kernel.clone()
+        neighbor_kernel[0, 0, 1, 1, 1] = 0.0
+        b_in = b_vol.unsqueeze(1)
+        rhs = torch.nn.functional.conv3d(b_in, neighbor_kernel, padding=1).squeeze(1)
+        rhs[:, ~is_interior_t] = 0.0
+        
+        # Standard CG Algorithm for A x = b
+        r = rhs - apply_L(x)
+        p = r.clone()
+        rsold = torch.sum(r * r, dim=(1,2,3)) # [3] independent for each component
+        
+        max_iter = self.cg_maxiter
+        tol = self.cg_tol
+        
+        for i in range(max_iter):
+            Ap = apply_L(p)
+            alpha = rsold / (torch.sum(p * Ap, dim=(1,2,3)) + 1e-10) # [3]
+            alpha_view = alpha.view(3, 1, 1, 1)
+            
+            x = x + alpha_view * p
+            r = r - alpha_view * Ap
+            rsnew = torch.sum(r * r, dim=(1,2,3))
+            
+            if torch.max(torch.sqrt(rsnew)) < tol:
+                print(f'converged at iter {i}.')
+                break
+                
+            beta = rsnew / (rsold + 1e-10)
+            beta_view = beta.view(3, 1, 1, 1)
+            p = r + beta_view * p
+            rsold = rsnew
         else:
-            print('done.')
-        orien_vol[0] = vx.reshape(R, R, R).astype(np.float32)
-
-        print(f'  [Laplace] Solving component Vy ({R}^3 grid) ...', end=' ', flush=True)
-        vy, info_y = gmres(A, b_rhs[:, 1], rtol=self.cg_tol, maxiter=self.cg_maxiter)
-        if info_y != 0:
-            print(f'  [Laplace] Warning: gmres did not converge (info={info_y})')
-        else:
-            print('done.')
-        orien_vol[1] = vy.reshape(R, R, R).astype(np.float32)
-
-        print(f'  [Laplace] Solving component Vz ({R}^3 grid) ...', end=' ', flush=True)
-        vz, info_z = gmres(A, b_rhs[:, 2], rtol=self.cg_tol, maxiter=self.cg_maxiter)
-        if info_z != 0:
-            print(f'  [Laplace] Warning: gmres did not converge (info={info_z})')
-        else:
-            print('done.')
-        orien_vol[2] = vz.reshape(R, R, R).astype(np.float32)
-
+            print(f'Warning: CG did not fully converge after {max_iter} iterations (max res: {torch.max(torch.sqrt(rsnew)):.4f})')
+            
+        # Combine solution with boundary values
+        orien_vol = x + b_vol
+        
         # ------------------------------------------------------------------
         # Step 4: Normalize orientation vectors
         # ------------------------------------------------------------------
-        norms = np.sqrt(np.sum(orien_vol**2, axis=0, keepdims=True)) + 1e-8
+        norms = torch.sqrt(torch.sum(orien_vol**2, dim=0, keepdim=True)) + 1e-8
         orien_vol = orien_vol / norms
-
-        return orien_vol  # [3, R, R, R]
+        
+        return orien_vol.cpu().numpy()  # [3, R, R, R]
 
     # ===================================================================
     # Trilinear interpolation (pure PyTorch F.grid_sample)

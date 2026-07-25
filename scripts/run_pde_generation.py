@@ -185,7 +185,7 @@ def main():
     
     # 2. Run Laplace PDE Strategy
     class DummyOpt:
-        pde_resolution = 128
+        pde_resolution = 512
         pde_dilation_iters = 6
         pde_cg_tol = 1e-4
         pde_cg_maxiter = 500
@@ -205,7 +205,7 @@ def main():
     scene = o3d.t.geometry.RaycastingScene()
     scene.add_triangles(head_t)
     
-    R = 128
+    R = 512
     b_min = np.array([-0.3, 1.0, -0.3], dtype=np.float32)
     b_max = np.array([ 0.3, 2.0,  0.3], dtype=np.float32)
     xs = np.linspace(b_min[0], b_max[0], R)
