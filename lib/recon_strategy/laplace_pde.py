@@ -45,6 +45,9 @@ from scipy.sparse.linalg import cg
 from scipy.ndimage import (
     binary_dilation, binary_erosion, gaussian_filter
 )
+import taichi as ti
+
+ti.init(arch=ti.cuda)
 
 from .base import BaseReconStrategy
 from lib.geometry import orthogonal
@@ -460,72 +463,127 @@ class LaplacePDEStrategy(BaseReconStrategy):
             b_vol[1, is_inner_surface_t] = 0.7 * hn[:, 1] + 0.3 * dy_t
             b_vol[2, is_inner_surface_t] = 0.7 * hn[:, 2] + 0.3 * dz_t
             
-        # Laplacian Kernel for L_int
+        # ------------------------------------------------------------------
+        # Taichi Sparse CG Solver
+        # ------------------------------------------------------------------
+        print(f'  [Taichi Laplace] Initializing Sparse SNode for {R}^3 grid...', end=' ', flush=True)
+        
+        x_ti = ti.Vector.field(3, dtype=ti.f32)
+        p_ti = ti.Vector.field(3, dtype=ti.f32)
+        r_ti = ti.Vector.field(3, dtype=ti.f32)
+        Ap_ti = ti.Vector.field(3, dtype=ti.f32)
+        is_int_ti = ti.field(dtype=ti.i32)
+        dot_res = ti.Vector.field(3, dtype=ti.f64, shape=())
+        
+        block = ti.root.pointer(ti.ijk, (R//8, R//8, R//8))
+        block.dense(ti.ijk, (8, 8, 8)).place(x_ti, p_ti, r_ti, Ap_ti, is_int_ti)
+        
+        @ti.kernel
+        def init_taichi_fields(
+            is_interior_arr: ti.types.ndarray(dtype=ti.u8),
+            rhs_arr: ti.types.ndarray(dtype=ti.f32)
+        ):
+            for i, j, k in ti.ndrange(R, R, R):
+                if is_interior_arr[i, j, k] > 0:
+                    is_int_ti[i, j, k] = 1
+                    x_ti[i, j, k] = ti.Vector([0.0, 0.0, 0.0])
+                    r_val = ti.Vector([rhs_arr[0, i, j, k], rhs_arr[1, i, j, k], rhs_arr[2, i, j, k]])
+                    r_ti[i, j, k] = r_val
+                    p_ti[i, j, k] = r_val
+
+        @ti.kernel
+        def apply_L():
+            for i, j, k in x_ti:
+                if is_int_ti[i, j, k] == 1:
+                    Ap_ti[i, j, k] = 6.0 * p_ti[i, j, k] - p_ti[i+1, j, k] - p_ti[i-1, j, k] - p_ti[i, j+1, k] - p_ti[i, j-1, k] - p_ti[i, j, k+1] - p_ti[i, j, k-1]
+
+        @ti.kernel
+        def compute_dot(v1: ti.template(), v2: ti.template()):
+            dot_res[None] = ti.Vector([0.0, 0.0, 0.0])
+            for i, j, k in x_ti:
+                if is_int_ti[i, j, k] == 1:
+                    v = ti.cast(v1[i, j, k] * v2[i, j, k], ti.f64)
+                    dot_res[None] += v
+
+        @ti.kernel
+        def update_x_r(a0: ti.f32, a1: ti.f32, a2: ti.f32):
+            alpha = ti.Vector([a0, a1, a2])
+            for i, j, k in x_ti:
+                if is_int_ti[i, j, k] == 1:
+                    x_ti[i, j, k] += alpha * p_ti[i, j, k]
+                    r_ti[i, j, k] -= alpha * Ap_ti[i, j, k]
+
+        @ti.kernel
+        def update_p(b0: ti.f32, b1: ti.f32, b2: ti.f32):
+            beta = ti.Vector([b0, b1, b2])
+            for i, j, k in x_ti:
+                if is_int_ti[i, j, k] == 1:
+                    p_ti[i, j, k] = beta * p_ti[i, j, k] + r_ti[i, j, k]
+
+        @ti.kernel
+        def copy_back_x(out: ti.types.ndarray(dtype=ti.f32)):
+            for i, j, k in x_ti:
+                if is_int_ti[i, j, k] == 1:
+                    out[0, i, j, k] = x_ti[i, j, k][0]
+                    out[1, i, j, k] = x_ti[i, j, k][1]
+                    out[2, i, j, k] = x_ti[i, j, k][2]
+                    
+        # RHS computation in PyTorch
         kernel = torch.zeros((1, 1, 3, 3, 3), dtype=torch.float32, device=self.cuda)
         kernel[0, 0, 1, 1, 1] = 6.0
         kernel[0, 0, 0, 1, 1] = -1.0; kernel[0, 0, 2, 1, 1] = -1.0
         kernel[0, 0, 1, 0, 1] = -1.0; kernel[0, 0, 1, 2, 1] = -1.0
         kernel[0, 0, 1, 1, 0] = -1.0; kernel[0, 0, 1, 1, 2] = -1.0
         
-        def apply_L(x):
-            # x is [3, R, R, R]
-            x_in = x.unsqueeze(1) # [3, 1, R, R, R]
-            out = torch.nn.functional.conv3d(x_in, kernel, padding=1)
-            out = out.squeeze(1) # [3, R, R, R]
-            out[:, ~is_interior_t] = 0.0 # Only defined on interior
-            return out
-            
-        print(f'  [Laplace] Solving Matrix-Free CG ({R}^3 grid) on GPU...', end=' ', flush=True)
-        
-        # Initial guess x = 0
-        x = torch.zeros_like(b_vol)
-        
-        # RHS = \sum_{neighbors} b_vol for interior nodes
         neighbor_kernel = -kernel.clone()
         neighbor_kernel[0, 0, 1, 1, 1] = 0.0
         b_in = b_vol.unsqueeze(1)
         rhs = torch.nn.functional.conv3d(b_in, neighbor_kernel, padding=1).squeeze(1)
         rhs[:, ~is_interior_t] = 0.0
         
-        # Standard CG Algorithm for A x = b
-        r = rhs - apply_L(x)
-        p = r.clone()
-        rsold = torch.sum(r * r, dim=(1,2,3)) # [3] independent for each component
+        init_taichi_fields(is_interior_t.to(torch.uint8).contiguous(), rhs.contiguous())
+        print('done.')
+        
+        print(f'  [Laplace] Solving CG with Taichi Sparse SNodes...', end=' ', flush=True)
+        
+        compute_dot(r_ti, r_ti)
+        rsold = dot_res[None].to_numpy()
         
         max_iter = self.cg_maxiter
         tol = self.cg_tol
         
         for i in range(max_iter):
-            Ap = apply_L(p)
-            alpha = rsold / (torch.sum(p * Ap, dim=(1,2,3)) + 1e-10) # [3]
+            apply_L()
+            compute_dot(p_ti, Ap_ti)
+            pAp = dot_res[None].to_numpy() + 1e-10
+            alpha = rsold / pAp
             
-            # Use completely in-place operations on each channel to avoid any temporary tensor allocations
-            for c in range(3):
-                x[c].add_(p[c], alpha=alpha[c].item())
-                r[c].sub_(Ap[c], alpha=alpha[c].item())
-                
-            rsnew = torch.sum(r * r, dim=(1,2,3))
+            update_x_r(float(alpha[0]), float(alpha[1]), float(alpha[2]))
             
-            if torch.max(torch.sqrt(rsnew)) < tol:
+            compute_dot(r_ti, r_ti)
+            rsnew = dot_res[None].to_numpy()
+            
+            if np.max(np.sqrt(rsnew)) < tol:
                 print(f'converged at iter {i}.')
                 break
                 
             beta = rsnew / (rsold + 1e-10)
-            
-            for c in range(3):
-                p[c].mul_(beta[c].item()).add_(r[c])
-                
+            update_p(float(beta[0]), float(beta[1]), float(beta[2]))
             rsold = rsnew
         else:
-            print(f'Warning: CG did not fully converge after {max_iter} iterations (max res: {torch.max(torch.sqrt(rsnew)):.4f})')
+            print(f'Warning: CG did not fully converge after {max_iter} iterations (max res: {np.max(np.sqrt(rsnew)):.4f})')
             
+        # Copy solution back to PyTorch
+        x = torch.zeros_like(b_vol)
+        copy_back_x(x.contiguous())
+        
         # Combine solution with boundary values
         orien_vol = x + b_vol
         
         # ------------------------------------------------------------------
         # Step 4: Normalize orientation vectors
         # ------------------------------------------------------------------
-        del kernel, neighbor_kernel, b_vol, b_in, rhs, r, p, Ap, is_surface_t, is_inner_surface_t, is_interior_t
+        del kernel, neighbor_kernel, b_vol, b_in, rhs, is_surface_t, is_inner_surface_t, is_interior_t
         torch.cuda.empty_cache()
         
         # Move to CPU for normalization to save VRAM
