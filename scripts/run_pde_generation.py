@@ -185,7 +185,7 @@ def main():
     
     # 2. Run Laplace PDE Strategy
     class DummyOpt:
-        pde_resolution = 384
+        pde_resolution = 512
         pde_dilation_iters = 6
         pde_cg_tol = 1e-4
         pde_cg_maxiter = 2000
