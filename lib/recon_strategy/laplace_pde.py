@@ -77,8 +77,10 @@ class LaplacePDEStrategy(BaseReconStrategy):
         self.resolution = getattr(opt, 'pde_resolution', 64)
         self.dilation_iters = getattr(opt, 'pde_dilation_iters', 6)
         self.cg_tol = getattr(opt, 'pde_cg_tol', 1e-4)
-        self.cg_maxiter = getattr(opt, 'pde_cg_maxiter', 500)
+        self.cg_maxiter = getattr(opt, 'pde_cg_maxiter', 2000)
         self.anisotropy = getattr(opt, 'pde_anisotropy', 0.8)
+        self.alpha_mix = getattr(opt, 'pde_alpha_mix', 0.1)
+        self.beta_mix = getattr(opt, 'pde_beta_mix', 1.0)
 
         # World-space bounding box
         self.b_min = getattr(opt, 'b_min', np.array([-0.3, 1.0, -0.3], dtype=np.float32))
@@ -408,11 +410,16 @@ class LaplacePDEStrategy(BaseReconStrategy):
             head_sdf = head_scene.compute_signed_distance(head_query_points).cpu().numpy()
             del head_query_points
             
-            # Restrict inner normal (outward puffiness) to the front of the head (Z > 0)
-            # For the back of the head (or outside 2D mask), we want it to extrapolate adjacent flow and cling to scalp.
-            is_front_vol = (pts_world[2] > 0.0)
-            is_inner_surface = (np.abs(head_sdf) < 0.015) & is_hair & is_front_vol
+            # Enforce inner normal (outward puffiness) everywhere on the scalp
+            # The 4th order equation will naturally bend it back down gracefully.
+            is_inner_surface = (np.abs(head_sdf) < 0.020) & is_hair
+            
+            # Synthetic outer boundary for the back of the head to force hair to fall down (gravity)
+            # Apply to points at the back (Z < 0), near the outer edge of the hair volume (4-5cm)
+            is_back_outer = (head_sdf > 0.04) & (head_sdf < 0.05) & is_hair & (pts_world[2] < 0.0)
+            
             # Exclude inner surface from outer surface
+            is_surface = is_surface | is_back_outer
             is_surface = is_surface & ~is_inner_surface
             
             head_sdf_3d = head_sdf.reshape(R, R, R)
@@ -453,6 +460,12 @@ class LaplacePDEStrategy(BaseReconStrategy):
         b_vol[1, is_surface_t] = torch.from_numpy(strand_dy[py[is_surface], px[is_surface]]).float().to(self.cuda)
         b_vol[2, is_surface_t] = torch.from_numpy(strand_dz[py[is_surface], px[is_surface]]).float().to(self.cuda)
         
+        is_back_outer_t = torch.from_numpy(is_back_outer.reshape(R, R, R)).bool().to(self.cuda)
+        if is_back_outer.any():
+            b_vol[0, is_back_outer_t] = 0.0
+            b_vol[1, is_back_outer_t] = -1.0 # Gravity!
+            b_vol[2, is_back_outer_t] = 0.0
+        
         # Inner surface
         if is_inner_surface.any():
             hn = torch.from_numpy(head_normals[is_inner_surface]).float().to(self.cuda)
@@ -472,11 +485,12 @@ class LaplacePDEStrategy(BaseReconStrategy):
         p_ti = ti.Vector.field(3, dtype=ti.f32)
         r_ti = ti.Vector.field(3, dtype=ti.f32)
         Ap_ti = ti.Vector.field(3, dtype=ti.f32)
+        tmp_ti = ti.Vector.field(3, dtype=ti.f32)
         is_int_ti = ti.field(dtype=ti.i32)
         dot_res = ti.Vector.field(3, dtype=ti.f64, shape=())
         
         block = ti.root.pointer(ti.ijk, (R//8, R//8, R//8))
-        block.dense(ti.ijk, (8, 8, 8)).place(x_ti, p_ti, r_ti, Ap_ti, is_int_ti)
+        block.dense(ti.ijk, (8, 8, 8)).place(x_ti, p_ti, r_ti, Ap_ti, tmp_ti, is_int_ti)
         
         @ti.kernel
         def init_taichi_fields(
@@ -492,10 +506,17 @@ class LaplacePDEStrategy(BaseReconStrategy):
                     p_ti[i, j, k] = r_val
 
         @ti.kernel
-        def apply_L():
+        def apply_L_step1():
             for i, j, k in x_ti:
                 if is_int_ti[i, j, k] == 1:
-                    Ap_ti[i, j, k] = 6.0 * p_ti[i, j, k] - p_ti[i+1, j, k] - p_ti[i-1, j, k] - p_ti[i, j+1, k] - p_ti[i, j-1, k] - p_ti[i, j, k+1] - p_ti[i, j, k-1]
+                    tmp_ti[i, j, k] = 6.0 * p_ti[i, j, k] - p_ti[i+1, j, k] - p_ti[i-1, j, k] - p_ti[i, j+1, k] - p_ti[i, j-1, k] - p_ti[i, j, k+1] - p_ti[i, j, k-1]
+
+        @ti.kernel
+        def apply_L_step2(alpha: ti.f32, beta: ti.f32):
+            for i, j, k in x_ti:
+                if is_int_ti[i, j, k] == 1:
+                    L_tmp = 6.0 * tmp_ti[i, j, k] - tmp_ti[i+1, j, k] - tmp_ti[i-1, j, k] - tmp_ti[i, j+1, k] - tmp_ti[i, j-1, k] - tmp_ti[i, j, k+1] - tmp_ti[i, j, k-1]
+                    Ap_ti[i, j, k] = alpha * tmp_ti[i, j, k] + beta * L_tmp
 
         @ti.kernel
         def compute_dot(v1: ti.template(), v2: ti.template()):
@@ -535,10 +556,10 @@ class LaplacePDEStrategy(BaseReconStrategy):
         kernel[0, 0, 1, 0, 1] = -1.0; kernel[0, 0, 1, 2, 1] = -1.0
         kernel[0, 0, 1, 1, 0] = -1.0; kernel[0, 0, 1, 1, 2] = -1.0
         
-        neighbor_kernel = -kernel.clone()
-        neighbor_kernel[0, 0, 1, 1, 1] = 0.0
         b_in = b_vol.unsqueeze(1)
-        rhs = torch.nn.functional.conv3d(b_in, neighbor_kernel, padding=1).squeeze(1)
+        L_b = torch.nn.functional.conv3d(b_in, kernel, padding=1)
+        L2_b = torch.nn.functional.conv3d(L_b, kernel, padding=1)
+        rhs = - (self.alpha_mix * L_b + self.beta_mix * L2_b).squeeze(1)
         rhs[:, ~is_interior_t] = 0.0
         
         init_taichi_fields(is_interior_t.to(torch.uint8).contiguous(), rhs.contiguous())
@@ -553,7 +574,8 @@ class LaplacePDEStrategy(BaseReconStrategy):
         tol = self.cg_tol
         
         for i in range(max_iter):
-            apply_L()
+            apply_L_step1()
+            apply_L_step2(float(self.alpha_mix), float(self.beta_mix))
             compute_dot(p_ti, Ap_ti)
             pAp = dot_res[None].to_numpy() + 1e-10
             alpha = rsold / pAp
@@ -583,7 +605,7 @@ class LaplacePDEStrategy(BaseReconStrategy):
         # ------------------------------------------------------------------
         # Step 4: Normalize orientation vectors
         # ------------------------------------------------------------------
-        del kernel, neighbor_kernel, b_vol, b_in, rhs, is_surface_t, is_inner_surface_t, is_interior_t
+        del kernel, b_vol, b_in, rhs, is_surface_t, is_inner_surface_t, is_interior_t, L_b, L2_b
         torch.cuda.empty_cache()
         
         # Move to CPU for normalization to save VRAM

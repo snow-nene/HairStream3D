@@ -188,7 +188,7 @@ def main():
         pde_resolution = 384
         pde_dilation_iters = 6
         pde_cg_tol = 1e-4
-        pde_cg_maxiter = 500
+        pde_cg_maxiter = 2000
         pde_anisotropy = 0.8
         
     mesh_path = args.mesh_obj
