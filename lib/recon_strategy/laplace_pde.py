@@ -77,9 +77,9 @@ class LaplacePDEStrategy(BaseReconStrategy):
         self.cg_maxiter = getattr(opt, 'pde_cg_maxiter', 500)
         self.anisotropy = getattr(opt, 'pde_anisotropy', 0.8)
 
-        # World-space bounding box (same as used by gen_mesh_real in mesh_util.py)
-        self.b_min = np.array([-0.3, 1.0, -0.3], dtype=np.float32)
-        self.b_max = np.array([ 0.3, 2.0,  0.3], dtype=np.float32)
+        # World-space bounding box
+        self.b_min = getattr(opt, 'b_min', np.array([-0.3, 1.0, -0.3], dtype=np.float32))
+        self.b_max = getattr(opt, 'b_max', np.array([ 0.3, 2.0,  0.3], dtype=np.float32))
 
         # Internal state: built by filter()
         self._occ_vol:   np.ndarray = None   # [Rx, Ry, Rz] float32 in [0, 1]

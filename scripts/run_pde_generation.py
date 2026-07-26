@@ -185,13 +185,37 @@ def main():
     
     # 2. Run Laplace PDE Strategy
     class DummyOpt:
-        pde_resolution = 768
+        pde_resolution = 384
         pde_dilation_iters = 6
         pde_cg_tol = 1e-4
         pde_cg_maxiter = 500
         pde_anisotropy = 0.8
         
     mesh_path = args.mesh_obj
+    
+    # Compute dynamic bounding box
+    head_mesh = o3d.io.read_triangle_mesh('data/head_model.obj')
+    head_bbox = head_mesh.get_axis_aligned_bounding_box()
+    b_min_dyn = head_bbox.get_min_bound()
+    b_max_dyn = head_bbox.get_max_bound()
+    
+    if mesh_path and os.path.exists(mesh_path):
+        hair_mesh = o3d.io.read_triangle_mesh(mesh_path)
+        hair_bbox = hair_mesh.get_axis_aligned_bounding_box()
+        b_min_dyn = np.minimum(b_min_dyn, hair_bbox.get_min_bound())
+        b_max_dyn = np.maximum(b_max_dyn, hair_bbox.get_max_bound())
+        
+    # Add a generous 3cm padding
+    padding = 0.03
+    b_min_dyn -= padding
+    b_max_dyn += padding
+    
+    b_min_dyn = b_min_dyn.astype(np.float32)
+    b_max_dyn = b_max_dyn.astype(np.float32)
+    
+    DummyOpt.b_min = b_min_dyn
+    DummyOpt.b_max = b_max_dyn
+    print(f"Dynamic Bounding Box: min {b_min_dyn}, max {b_max_dyn}")
         
     strategy = LaplacePDEStrategy(DummyOpt(), cuda)
     strategy.filter(data, mesh_path=mesh_path)
@@ -200,14 +224,14 @@ def main():
     
     # 3. Build inner collision SDF and Normal volume for head_model.obj
     print("Building inner collision volume for head_model...")
-    head_mesh = o3d.io.read_triangle_mesh('data/head_model.obj')
+    # head_mesh was already loaded above
     head_t = o3d.t.geometry.TriangleMesh.from_legacy(head_mesh)
     scene = o3d.t.geometry.RaycastingScene()
     scene.add_triangles(head_t)
     
-    R = 768
-    b_min = np.array([-0.3, 1.0, -0.3], dtype=np.float32)
-    b_max = np.array([ 0.3, 2.0,  0.3], dtype=np.float32)
+    R = 384
+    b_min = b_min_dyn
+    b_max = b_max_dyn
     xs = np.linspace(b_min[0], b_max[0], R)
     ys = np.linspace(b_min[1], b_max[1], R)
     zs = np.linspace(b_min[2], b_max[2], R)
