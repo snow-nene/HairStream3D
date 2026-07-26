@@ -272,34 +272,7 @@ def main():
     dx_dx = cv2.Sobel(strand_dx, cv2.CV_32F, 1, 0, ksize=3)
     dy_dy = cv2.Sobel(strand_dy, cv2.CV_32F, 0, 1, ksize=3)
     divergence = (dx_dx + dy_dy) * mask
-    divergence = cv2.GaussianBlur(divergence, (5, 5), 0)
-    
-    # Edges & Watershed
-    dz_dx = cv2.Sobel(depth_map, cv2.CV_32F, 1, 0, ksize=3)
-    dz_dy = cv2.Sobel(depth_map, cv2.CV_32F, 0, 1, ksize=3)
-    depth_grad_mag = np.sqrt(dz_dx**2 + dz_dy**2) * mask
-    depth_grad_mag = np.clip(depth_grad_mag / (np.percentile(depth_grad_mag[mask>0], 98) + 1e-5), 0, 1)
-    
-    dx_dy = cv2.Sobel(strand_dx, cv2.CV_32F, 0, 1, ksize=3)
-    dy_dx = cv2.Sobel(strand_dy, cv2.CV_32F, 1, 0, ksize=3)
-    orien_grad_mag = np.sqrt(dx_dx**2 + dx_dy**2 + dy_dx**2 + dy_dy**2) * mask
-    orien_grad_mag = np.clip(orien_grad_mag / (np.percentile(orien_grad_mag[mask>0], 98) + 1e-5), 0, 1)
-    
-    combined_edges = np.maximum(depth_grad_mag, orien_grad_mag)
-    binary_edges = (combined_edges > 0.05).astype(np.uint8) * 255
-    kernel = np.ones((3,3), np.uint8)
-    binary_edges = cv2.morphologyEx(binary_edges, cv2.MORPH_CLOSE, kernel)
-    
-    sure_bg = cv2.dilate((1 - mask).astype(np.uint8), kernel, iterations=3) * 255
-    sure_fg = ((mask > 0) & (binary_edges == 0)).astype(np.uint8) * 255
-    sure_fg = cv2.erode(sure_fg, kernel, iterations=2)
-    unknown = cv2.subtract(mask.astype(np.uint8)*255, cv2.add(sure_bg, sure_fg))
-    ret, markers = cv2.connectedComponents(sure_fg)
-    markers = markers + 1
-    markers[unknown == 255] = 0
-    img_for_ws = np.zeros((strand_img.shape[0], strand_img.shape[1], 3), dtype=np.uint8)
-    img_for_ws[mask > 0] = [255, 255, 255]
-    markers = cv2.watershed(img_for_ws, markers)
+    divergence = cv2.GaussianBlur(divergence, (5, 5), 0)    # Skip watershed and use KMeans directly for exactly 1024 clusters
     
     # Upload features to PyTorch
     div_map_t = torch.from_numpy(divergence).float().unsqueeze(0).unsqueeze(0).to(cuda) # [1, 1, 1024, 1024]
@@ -326,44 +299,20 @@ def main():
     uv_px = ((uv + 1.0) * 0.5 * 511).long()
     uv_px = torch.clamp(uv_px, 0, 511)
     
-    # Get cluster ID for each root
-    markers_t = torch.from_numpy(markers).to(cuda) # [1024, 1024]
-    root_cluster_ids = markers_t[uv_px[1], uv_px[0]] # [N]
+    print("Selecting 1024 Guide Strands using KMeans...")
+    from sklearn.cluster import MiniBatchKMeans
     
-    print("Selecting Guide Strands from 2D Centroids...")
-    # Find all unique clusters in the 2D image (not just the ones hit by roots)
-    markers_t = torch.from_numpy(markers).to(cuda) # [512, 512]
-    unique_clusters = torch.unique(markers_t)
+    uv_np = uv_px.float().cpu().numpy().T # [N, 2]
+    
+    kmeans = MiniBatchKMeans(n_clusters=1024, random_state=42, n_init="auto", batch_size=2048).fit(uv_np)
+    centroids_list = kmeans.cluster_centers_.tolist()
     
     guide_idx_list = []
-    cluster_to_guide_arr_idx = {}
-    valid_idx = 0
     
-    # Pre-calculate a grid of XY coordinates for centroid calculation
-    yy, xx = torch.meshgrid(torch.arange(512, device=cuda), torch.arange(512, device=cuda), indexing='ij')
-    centroids_list = []
-    
-    for cid in unique_clusters:
-        if cid <= 1: continue 
-        
-        # Pixels belonging to this cluster
-        mask_cid = (markers_t == cid)
-        if not mask_cid.any(): continue
-        
-        # Calculate centroid of the cluster in 2D
-        centroid_y = yy[mask_cid].float().mean()
-        centroid_x = xx[mask_cid].float().mean()
-        
-        centroids_list.append((centroid_x.item(), centroid_y.item()))
-        
-        # Find the globally closest root in 2D projection
-        # uv_px is [2, N] (x, y)
-        dist_sq = (uv_px[0].float() - centroid_x)**2 + (uv_px[1].float() - centroid_y)**2
+    for cx, cy in centroids_list:
+        dist_sq = (uv_px[0].float() - cx)**2 + (uv_px[1].float() - cy)**2
         best_global_idx = torch.argmin(dist_sq)
-        
         guide_idx_list.append(best_global_idx.item())
-        cluster_to_guide_arr_idx[cid.item()] = valid_idx
-        valid_idx += 1
         
     num_clusters = len(guide_idx_list)
     print(f"Extracted {num_clusters} Data-Driven Guide Strands.")
@@ -371,10 +320,6 @@ def main():
     guide_idx_tensor = torch.tensor(guide_idx_list, device=cuda)
     guide_roots = root_tensor[:, :, guide_idx_tensor] # [1, 3, K]
     
-    # Map every root to the index in the guide_strands array
-    # guide_idx_tensor contains the global index of the guides.
-    # For a root in cluster CID, its guide index is the position of CID in unique_clusters.
-
     centroids_t = torch.tensor(centroids_list, device=cuda) # [K, 2]
     
     # Map EVERY root to its nearest centroid to prevent chaotic criss-crossing of background roots
@@ -393,7 +338,7 @@ def main():
     guide_strands_t = torch.from_numpy(guide_strands).to(cuda).permute(1, 2, 0) # [num_sample, 3, K]
 
     print("Integrating Full Strands with 2D-Driven RK4 (Clustering & Divergence)...")
-    valid_cluster_mask = (root_cluster_ids > 1).float() # [N]
+    valid_cluster_mask = torch.from_numpy(mask).to(cuda)[uv_px[1], uv_px[0]] # [N] # [N]
     
     strands = hair_synthesis_rk4(
         strategy, cuda, root_tensor, calib_tensor, 
