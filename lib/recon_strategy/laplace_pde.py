@@ -202,37 +202,43 @@ class LaplacePDEStrategy(BaseReconStrategy):
         b_min, b_max = self.b_min, self.b_max
 
         # --- voxel coordinate arrays [R] ---
-        xs = np.linspace(b_min[0], b_max[0], R)
-        ys = np.linspace(b_min[1], b_max[1], R)
-        zs = np.linspace(b_min[2], b_max[2], R)
-
-        # --- project voxel grid onto 2D image using orthographic projection ---
-        # For each 3D voxel we need to find its 2D pixel and look up depth
-        # We sample only voxels within the column where hair_mask > 0
+        # Generate entirely on GPU to bypass single-threaded Numpy bottleneck
+        xs = torch.linspace(b_min[0], b_max[0], R, dtype=torch.float32, device=self.cuda)
+        ys = torch.linspace(b_min[1], b_max[1], R, dtype=torch.float32, device=self.cuda)
+        zs = torch.linspace(b_min[2], b_max[2], R, dtype=torch.float32, device=self.cuda)
 
         # Meshgrid of 3D voxel centers
-        gx, gy, gz = np.meshgrid(xs, ys, zs, indexing='ij')  # [R, R, R]
-        pts_world = np.stack(
-            [gx.ravel(), gy.ravel(), gz.ravel()], axis=0
-        ).astype(np.float32)  # [3, R^3]
+        gx, gy, gz = torch.meshgrid(xs, ys, zs, indexing='ij')  # [R, R, R]
+        pts_world_t = torch.stack(
+            [gx.reshape(-1), gy.reshape(-1), gz.reshape(-1)], dim=0
+        )  # [3, R^3] on GPU
+        del gx, gy, gz
 
         # Orthographic projection to image UV in [-1, 1]
-        # We use the loaded calib matrix for accurate projection
-        calib = self._data['calib'].cpu().numpy()  # [4, 4]
+        calib = torch.from_numpy(self._data['calib'].cpu().numpy()).float().to(self.cuda)
         R3 = calib[:3, :3]
         t3 = calib[:3, 3:4]
-        pts_cam = R3 @ pts_world + t3  # [3, R^3]
-        uv = pts_cam[:2]  # [2, R^3]  in [-1, 1] approximately
+        pts_cam_t = torch.matmul(R3, pts_world_t) + t3  # [3, R^3]
+        
+        uv_t = pts_cam_t[:2]  # [2, R^3]  in [-1, 1] approximately
 
         # Convert UV to pixel indices
-        px = np.clip(((uv[0] + 1.0) / 2.0 * W).astype(int), 0, W - 1)
-        py = np.clip(((uv[1] + 1.0) / 2.0 * H).astype(int), 0, H - 1)
+        px_t = torch.clamp(((uv_t[0] + 1.0) / 2.0 * W).long(), 0, W - 1)
+        py_t = torch.clamp(((uv_t[1] + 1.0) / 2.0 * H).long(), 0, H - 1)
+        del uv_t
+        
+        # Download variables back to CPU for numpy operations
+        px = px_t.cpu().numpy()
+        py = py_t.cpu().numpy()
+        vox_depth = pts_cam_t[2].cpu().numpy()
+        pts_world = pts_world_t.cpu().numpy()
+        
+        del pts_world_t, pts_cam_t, px_t, py_t
+        torch.cuda.empty_cache()
 
-        # Each voxel's visible depth from depth_map
-        surf_depth = depth_map[py, px]   # [R^3] surface depth at corresponding pixel
-        vox_depth  = pts_cam[2]           # [R^3] depth of the voxel itself
         mask_2d    = hair_mask[py, px]    # [R^3] is this pixel inside hair
-
+        surf_depth = depth_map[py, px]
+        
         if mesh_path is not None:
             import open3d as o3d
             mesh = o3d.io.read_triangle_mesh(mesh_path)
@@ -240,11 +246,22 @@ class LaplacePDEStrategy(BaseReconStrategy):
             scene = o3d.t.geometry.RaycastingScene()
             scene.add_triangles(mesh_t)
             
-            query_points = o3d.core.Tensor(pts_world.T, dtype=o3d.core.Dtype.Float32)
-            distances = scene.compute_distance(query_points).cpu().numpy()
+            # Narrow Band SDF optimization - only use 2D mask
+            valid_mask = (mask_2d > 0.5)
+            valid_indices = np.where(valid_mask)[0]
             
-            # A shell of 0.05 around the extracted Pixal3D hair mesh covers the true volume
-            inside = (distances < 0.05) & (mask_2d > 0.5)
+            query_points = o3d.core.Tensor(pts_world[:, valid_indices].T, dtype=o3d.core.Dtype.Float32)
+            del pts_world  # Free massive arrays
+            
+            distances_narrow = scene.compute_distance(query_points).cpu().numpy()
+            del query_points
+            
+            # Initialize global distance array to a large value (outside the narrow band)
+            distances = np.ones(mask_2d.shape, dtype=np.float32) * 100.0
+            distances[valid_indices] = distances_narrow
+            
+            # A 0.3 shell bounded by front surface depth completely fills the distance between front mesh and scalp
+            inside = (distances < 0.3) & (mask_2d > 0.5) & (vox_depth >= surf_depth - 0.02)
             occ.ravel()[inside] = 1.0
         else:
             # A voxel is occupied if:
@@ -319,29 +336,39 @@ class LaplacePDEStrategy(BaseReconStrategy):
         # Step 2: Map 2D directions to 3D voxel boundary conditions
         # ------------------------------------------------------------------
         H, W = hair_mask.shape
-        xs = np.linspace(b_min[0], b_max[0], R)
-        ys = np.linspace(b_min[1], b_max[1], R)
-        zs = np.linspace(b_min[2], b_max[2], R)
+        # Build voxel grids on GPU to bypass single-threaded Numpy bottleneck
+        xs = torch.linspace(b_min[0], b_max[0], R, dtype=torch.float32, device=self.cuda)
+        ys = torch.linspace(b_min[1], b_max[1], R, dtype=torch.float32, device=self.cuda)
+        zs = torch.linspace(b_min[2], b_max[2], R, dtype=torch.float32, device=self.cuda)
 
-        # Build voxel grids
-        gx, gy, gz = np.meshgrid(xs, ys, zs, indexing='ij')  # [R, R, R]
-        pts_world = np.stack(
-            [gx.ravel(), gy.ravel(), gz.ravel()], axis=0
-        ).astype(np.float32)  # [3, R^3]
+        gx, gy, gz = torch.meshgrid(xs, ys, zs, indexing='ij')  # [R, R, R]
+        pts_world_t = torch.stack(
+            [gx.reshape(-1), gy.reshape(-1), gz.reshape(-1)], dim=0
+        )  # [3, R^3]
+        del gx, gy, gz
 
-        calib = self._data['calib'].cpu().numpy()
+        calib = torch.from_numpy(self._data['calib'].cpu().numpy()).float().to(self.cuda)
         R3 = calib[:3, :3]
         t3 = calib[:3, 3:4]
-        pts_cam = R3 @ pts_world + t3
+        pts_cam_t = torch.matmul(R3, pts_world_t) + t3
+        
+        uv_t = pts_cam_t[:2]
 
         # Projected pixel coordinates
-        uv = pts_cam[:2]
-        px = np.clip(((uv[0] + 1.0) / 2.0 * W).astype(int), 0, W - 1)
-        py = np.clip(((uv[1] + 1.0) / 2.0 * H).astype(int), 0, H - 1)
-
-        surf_depth = depth_map[py, px]
-        vox_depth  = pts_cam[2]
+        px_t = torch.clamp(((uv_t[0] + 1.0) / 2.0 * W).long(), 0, W - 1)
+        py_t = torch.clamp(((uv_t[1] + 1.0) / 2.0 * H).long(), 0, H - 1)
+        del uv_t
+        
+        # Download variables back to CPU for numpy operations
+        px = px_t.cpu().numpy()
+        py = py_t.cpu().numpy()
+        vox_depth = pts_cam_t[2].cpu().numpy()
+        pts_world = pts_world_t.cpu().numpy()
+        
+        del pts_world_t, pts_cam_t, px_t, py_t
+        torch.cuda.empty_cache()
         mask_2d    = hair_mask[py, px]
+        surf_depth = depth_map[py, px]
 
         margin = (b_max[2] - b_min[2]) / R * 2.0
         
@@ -352,12 +379,19 @@ class LaplacePDEStrategy(BaseReconStrategy):
             scene = o3d.t.geometry.RaycastingScene()
             scene.add_triangles(mesh_t)
             
-            query_points = o3d.core.Tensor(pts_world.T, dtype=o3d.core.Dtype.Float32)
-            distances = scene.compute_distance(query_points).cpu().numpy()
+            # Narrow Band SDF optimization - only use 2D mask, don't cut off Z axis!
+            valid_mask = (mask_2d > 0.5)
+            valid_indices = np.where(valid_mask)[0]
+            
+            query_points = o3d.core.Tensor(pts_world[:, valid_indices].T, dtype=o3d.core.Dtype.Float32)
+            
+            distances_narrow = scene.compute_distance(query_points).cpu().numpy()
+            distances = np.ones(mask_2d.shape, dtype=np.float32) * 100.0
+            distances[valid_indices] = distances_narrow
             
             # The surface voxels are those very close to the mesh
             is_surface = (distances < 0.015) & (mask_2d > 0.5)
-            # The interior voxels are those within the thick shell
+            # The interior voxels should span the entire gap from the front surface to the scalp
             is_hair = (distances < 0.05) & (mask_2d > 0.5)
             
             # Also compute inner boundary (scalp) to push hair outwards
@@ -366,7 +400,11 @@ class LaplacePDEStrategy(BaseReconStrategy):
             head_scene = o3d.t.geometry.RaycastingScene()
             head_scene.add_triangles(head_t)
             
-            head_sdf = head_scene.compute_signed_distance(query_points).cpu().numpy()
+            # Compute head SDF on the full grid so gradients (normals) are accurate and smooth!
+            head_query_points = o3d.core.Tensor(pts_world.T, dtype=o3d.core.Dtype.Float32)
+            head_sdf = head_scene.compute_signed_distance(head_query_points).cpu().numpy()
+            del head_query_points
+            
             # Restrict inner normal (outward puffiness) to the front of the head (Z > 0)
             # For the back of the head (or outside 2D mask), we want it to extrapolate adjacent flow and cling to scalp.
             is_front_vol = (pts_world[2] > 0.0)
@@ -375,9 +413,17 @@ class LaplacePDEStrategy(BaseReconStrategy):
             is_surface = is_surface & ~is_inner_surface
             
             head_sdf_3d = head_sdf.reshape(R, R, R)
-            grad_x = np.gradient(head_sdf_3d, axis=0).ravel()
-            grad_y = np.gradient(head_sdf_3d, axis=1).ravel()
-            grad_z = np.gradient(head_sdf_3d, axis=2).ravel()
+            
+            # Offload heavy gradient calculation to GPU
+            head_sdf_t = torch.from_numpy(head_sdf_3d).to(self.cuda)
+            grad_x, grad_y, grad_z = torch.gradient(head_sdf_t, spacing=1, dim=(0, 1, 2))
+            
+            grad_x = grad_x.cpu().numpy().ravel()
+            grad_y = grad_y.cpu().numpy().ravel()
+            grad_z = grad_z.cpu().numpy().ravel()
+            del head_sdf_t
+            torch.cuda.empty_cache()
+            
             head_normals = np.stack([grad_x, grad_y, grad_z], axis=1)
             norms = np.linalg.norm(head_normals, axis=1, keepdims=True) + 1e-8
             head_normals = head_normals / norms
@@ -452,10 +498,12 @@ class LaplacePDEStrategy(BaseReconStrategy):
         for i in range(max_iter):
             Ap = apply_L(p)
             alpha = rsold / (torch.sum(p * Ap, dim=(1,2,3)) + 1e-10) # [3]
-            alpha_view = alpha.view(3, 1, 1, 1)
             
-            x = x + alpha_view * p
-            r = r - alpha_view * Ap
+            # Use completely in-place operations on each channel to avoid any temporary tensor allocations
+            for c in range(3):
+                x[c].add_(p[c], alpha=alpha[c].item())
+                r[c].sub_(Ap[c], alpha=alpha[c].item())
+                
             rsnew = torch.sum(r * r, dim=(1,2,3))
             
             if torch.max(torch.sqrt(rsnew)) < tol:
@@ -463,8 +511,10 @@ class LaplacePDEStrategy(BaseReconStrategy):
                 break
                 
             beta = rsnew / (rsold + 1e-10)
-            beta_view = beta.view(3, 1, 1, 1)
-            p = r + beta_view * p
+            
+            for c in range(3):
+                p[c].mul_(beta[c].item()).add_(r[c])
+                
             rsold = rsnew
         else:
             print(f'Warning: CG did not fully converge after {max_iter} iterations (max res: {torch.max(torch.sqrt(rsnew)):.4f})')
@@ -475,10 +525,18 @@ class LaplacePDEStrategy(BaseReconStrategy):
         # ------------------------------------------------------------------
         # Step 4: Normalize orientation vectors
         # ------------------------------------------------------------------
-        norms = torch.sqrt(torch.sum(orien_vol**2, dim=0, keepdim=True)) + 1e-8
-        orien_vol = orien_vol / norms
+        del kernel, neighbor_kernel, b_vol, b_in, rhs, r, p, Ap, is_surface_t, is_inner_surface_t, is_interior_t
+        torch.cuda.empty_cache()
         
-        return orien_vol.cpu().numpy()  # [3, R, R, R]
+        # Move to CPU for normalization to save VRAM
+        orien_vol_cpu = orien_vol.cpu().numpy()
+        del orien_vol, x
+        torch.cuda.empty_cache()
+        
+        norms = np.sqrt(np.sum(orien_vol_cpu**2, axis=0, keepdims=True)) + 1e-8
+        orien_vol_cpu = orien_vol_cpu / norms
+        
+        return orien_vol_cpu  # [3, R, R, R]
 
     # ===================================================================
     # Trilinear interpolation (pure PyTorch F.grid_sample)
