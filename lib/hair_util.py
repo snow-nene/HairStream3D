@@ -58,27 +58,31 @@ def hair_synthesis_DSH(net, cuda, root_tensor, calib_tensor, num_sample=100, hai
 
     return hair_strands.permute(2, 0, 1).cpu().detach().numpy()
 
-def save_strands_with_mesh(strands, mesh_path, outputpath, err=0.3, is_eval=False):
-    # Since mesh_path is only a front-facing shell in our new pipeline, 
-    # clipping against it destroys the back of the head hair (baldness).
-    # The PDE RK4 integrator already respects the inner collision boundary.
-    # We will just save all strands directly.
-    
+def save_strands_with_mesh(strands, mesh_path, outputpath, err=0.3, is_eval=False, min_len=0.05):
+    """
+    保存生成的 3D 发丝 PLY 模型，并增加自动修剪/过滤过短发丝的功能。
+    min_len (float): 发丝最小物理长度限制（单位：米，默认 0.05m = 5cm），低于此长度的发丝将被自动修剪/滤除。
+    """
     lst_pc_all_valid = []
     lst_num_pt = []
     pc_all_valid = []
     lines = []
     sline = 0
 
-    # Optional: Clip strands if they go below the neck (Y > some value, in Blender Y is UP, wait, in our coords Y is UP? No, FLAME Y is UP but inverted? Let's just keep all points for now).
-    # Wait, in our coords, Y is DOWN in image space, but in 3D, Y is UP?
-    # Let's just keep the full 300 steps. The PDE field should guide them smoothly.
-    
     for i in range(strands.shape[0]):
         current_pc_all_valid = []
-        if np.dot(strands[i,0], strands[i,0]) < 0.001 or np.dot(strands[i,1], strands[i,1]) < 0.001:
+        if np.dot(strands[i, 0], strands[i, 0]) < 0.001 or np.dot(strands[i, 1], strands[i, 1]) < 0.001:
             continue
             
+        # 计算整根发丝的总物理长度 (Euclidean length)
+        pts = strands[i]  # [num_sample, 3]
+        segment_lengths = np.linalg.norm(pts[1:] - pts[:-1], axis=1)
+        total_length = np.sum(segment_lengths)
+        
+        # 过滤/修剪过短的发丝（如物理长度 < min_len）
+        if total_length < min_len:
+            continue
+
         num_pt = 0
         for j in range(strands.shape[1]):
             current_pc_all_valid.append(strands[i][j])
@@ -89,13 +93,14 @@ def save_strands_with_mesh(strands, mesh_path, outputpath, err=0.3, is_eval=Fals
 
     for i in range(len(lst_pc_all_valid)):
         pc_all_valid.extend(lst_pc_all_valid[i])
-        for j in range(lst_num_pt[i]-1):
+        for j in range(lst_num_pt[i] - 1):
             lines.append([sline + j, sline + j + 1])
         sline += lst_num_pt[i]
 
     import open3d as o3d
     line_set = o3d.geometry.LineSet(points=o3d.utility.Vector3dVector(np.asarray(pc_all_valid)), lines=o3d.utility.Vector2iVector(lines))
     o3d.io.write_line_set(outputpath, line_set)
+    print(f"[Strand Pruning] Filtered out short strands (< {min_len*100:.1f} cm). Kept {len(lst_pc_all_valid)} / {strands.shape[0]} strands.")
 
 def get_hair_root(filepath='./data/roots10k.obj'):
     from lib.mesh_util import load_obj_mesh

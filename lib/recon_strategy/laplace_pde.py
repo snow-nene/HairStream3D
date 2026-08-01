@@ -431,10 +431,32 @@ class LaplacePDEStrategy(BaseReconStrategy):
             head_normals = head_normals / norms
             
         else:
+            import open3d as o3d
+            head_mesh = o3d.io.read_triangle_mesh('data/head_model.obj')
+            head_t = o3d.t.geometry.TriangleMesh.from_legacy(head_mesh)
+            head_scene = o3d.t.geometry.RaycastingScene()
+            head_scene.add_triangles(head_t)
+            
+            head_query_points = o3d.core.Tensor(pts_world.T, dtype=o3d.core.Dtype.Float32)
+            head_sdf = head_scene.compute_signed_distance(head_query_points).cpu().numpy()
+            del head_query_points
+            
             is_surface = (mask_2d > 0.5) & (np.abs(vox_depth - surf_depth) < margin)
             is_hair    = (mask_2d > 0.5) & (vox_depth <= (surf_depth + margin))
-            is_inner_surface = np.zeros_like(is_surface, dtype=bool)
+            
+            # Enforce inner normal (outward puffiness) on the forehead/scalp
+            is_front_vol = (pts_world[2] > 0.0)
+            is_inner_surface = (np.abs(head_sdf) < 0.015) & is_hair & is_front_vol
             is_back_outer = np.zeros_like(is_surface, dtype=bool)
+            is_surface = is_surface & ~is_inner_surface
+            
+            head_sdf_3d = head_sdf.reshape(R, R, R)
+            grad_x = np.gradient(head_sdf_3d, axis=0).ravel()
+            grad_y = np.gradient(head_sdf_3d, axis=1).ravel()
+            grad_z = np.gradient(head_sdf_3d, axis=2).ravel()
+            head_normals = np.stack([grad_x, grad_y, grad_z], axis=1)
+            norms = np.linalg.norm(head_normals, axis=1, keepdims=True) + 1e-8
+            head_normals = head_normals / norms
 
         # ------------------------------------------------------------------
         # Step 3: Build the Laplace linear system and solve per component (Matrix-Free GPU)
@@ -465,9 +487,9 @@ class LaplacePDEStrategy(BaseReconStrategy):
             dx_t = torch.from_numpy(strand_dx[py[is_inner_surface], px[is_inner_surface]]).float().to(self.cuda)
             dy_t = torch.from_numpy(strand_dy[py[is_inner_surface], px[is_inner_surface]]).float().to(self.cuda)
             dz_t = torch.from_numpy(strand_dz[py[is_inner_surface], px[is_inner_surface]]).float().to(self.cuda)
-            b_vol[0, is_inner_surface_t] = 0.7 * hn[:, 0] + 0.3 * dx_t
-            b_vol[1, is_inner_surface_t] = 0.7 * hn[:, 1] + 0.3 * dy_t
-            b_vol[2, is_inner_surface_t] = 0.7 * hn[:, 2] + 0.3 * dz_t
+            b_vol[0, is_inner_surface_t] = 0.3 * hn[:, 0] + 0.7 * dx_t
+            b_vol[1, is_inner_surface_t] = 0.3 * hn[:, 1] + 0.7 * dy_t
+            b_vol[2, is_inner_surface_t] = 0.3 * hn[:, 2] + 0.7 * dz_t
             
         # ------------------------------------------------------------------
         # Taichi Sparse CG Solver

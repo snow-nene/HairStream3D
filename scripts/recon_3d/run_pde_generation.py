@@ -135,8 +135,8 @@ def hair_synthesis_rk4(strategy, cuda, root_tensor, calib_tensor, num_sample=100
             # Normalize the normal
             normal_val = torch.nn.functional.normalize(normal_val, dim=0)
             
-            # If inside the head (SDF < 0.001), push out along the normal
-            margin = 0.001
+            # Moderate collision margin (5mm) to prevent piercing without introducing excessive bulkiness
+            margin = 0.005
             penetration = margin - sdf_val
             mask = (penetration > 0).float() # [1, N]
             
@@ -149,10 +149,12 @@ def hair_synthesis_rk4(strategy, cuda, root_tensor, calib_tensor, num_sample=100
 def main():
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--img_name", default="0d285f5be7fa09c3dbbf1c9334047888")
+    parser.add_argument("--img_name", default="0a1ba3dbefc8934ab60577c5c91f66a0")
     parser.add_argument("--mesh_obj", help="Optional custom hair mesh to restrict strands")
-    parser.add_argument("--out_ply", default="results/test_pde_rk4/hair.ply")
+    parser.add_argument("--out_ply", default="results/test_pde_rk4/hair_mv_256.ply")
     parser.add_argument("--roots", default="data/roots10k.obj", help="Path to roots obj file")
+    parser.add_argument("--pde_resolution", type=int, default=256, help="PDE resolution")
+    parser.add_argument("--min_len", type=float, default=0.05, help="Minimum physical length threshold (in meters) to prune short strands")
     args = parser.parse_args()
 
     os.makedirs(os.path.dirname(args.out_ply), exist_ok=True)
@@ -185,7 +187,7 @@ def main():
     
     # 2. Run Laplace PDE Strategy
     class DummyOpt:
-        pde_resolution = 512
+        pde_resolution = args.pde_resolution
         pde_dilation_iters = 6
         pde_cg_tol = 1e-4
         pde_cg_maxiter = 2000
@@ -348,8 +350,8 @@ def main():
         div_map_t=div_map_t, valid_cluster_mask=valid_cluster_mask
     )
     
-    print(f"Clipping strands with mesh {mesh_path}...")
-    save_strands_with_mesh(strands, mesh_path, args.out_ply, 0.3, is_eval=False)
+    print(f"Pruning short strands (< {args.min_len*100:.1f} cm) and saving PLY...")
+    save_strands_with_mesh(strands, mesh_path, args.out_ply, 0.3, is_eval=False, min_len=args.min_len)
     print(f"Saved to {args.out_ply}")
 
 if __name__ == '__main__':
