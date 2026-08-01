@@ -1,103 +1,102 @@
-# train_hisa.py Usage
+# train_hisa.py 使用说明
 
-This document explains how to train strand-map prediction with `scripts/train_hisa.py`.
+本文档说明如何使用 `scripts/train/train_hisa.py` 来训练 strand-map 预测模型。
 
-```
+```bash
 # 论文原作 baseline（仅 L1）
-PYTHONPATH=. pixi run python scripts/train_hisa.py \
+PYTHONPATH=. pixi run python scripts/train/train_hisa.py \
   --img2strand_backbone hrnet --hrnet_variant hrnet_w32 \
   --w_l1 1.0 --w_cos 0.0 --w_tv 0.0 --w_struct 0.0 --w_aux 0.0
 
 # L1 + 余弦 + TV + 结构 + 多尺度（全量）
-PYTHONPATH=. pixi run python scripts/train_hisa.py \
+PYTHONPATH=. pixi run python scripts/train/train_hisa.py \
   --img2strand_backbone hrnet --hrnet_variant hrnet_w32 \
   --w_l1 1.0 --w_cos 1.0 --w_tv 0.0 --w_struct 0.0 --w_aux 0.3
-
 ```
-
-```
-# 仅余弦相似度（baseline）
-pixi run python scripts/train_hisa.py --w_cos 1.0 --w_tv 0.0 --w_struct 0.0 --w_aux 0.0
-
-# cosine + TV 平滑
-pixi run python scripts/train_hisa.py --w_cos 1.0 --w_tv 0.1 --w_struct 0.0 --w_aux 0.0
-
-# cosine + TV + 结构相似性
-pixi run python scripts/train_hisa.py --w_cos 1.0 --w_tv 0.1 --w_struct 0.05 --w_aux 0.0
-
-# 全量损失（推荐）
-pixi run python scripts/train_hisa.py --w_cos 1.0 --w_tv 0.1 --w_struct 0.05 --w_aux 0.3
-
-```
-## 1. Basic command
 
 ```bash
-pixi run python -m scripts.train_hisa
+# 仅余弦相似度（baseline）
+pixi run python scripts/train/train_hisa.py --w_cos 1.0 --w_tv 0.0 --w_struct 0.0 --w_aux 0.0
+
+# 余弦相似度 + TV 平滑
+pixi run python scripts/train/train_hisa.py --w_cos 1.0 --w_tv 0.1 --w_struct 0.0 --w_aux 0.0
+
+# 余弦相似度 + TV 平滑 + 结构相似性
+pixi run python scripts/train/train_hisa.py --w_cos 1.0 --w_tv 0.1 --w_struct 0.05 --w_aux 0.0
+
+# 全量损失（推荐）
+pixi run python scripts/train/train_hisa.py --w_cos 1.0 --w_tv 0.1 --w_struct 0.05 --w_aux 0.3
 ```
 
-The script uses:
-- dataset root: `./datasets/HiSa_HiDa`
-- train split: `./datasets/HiSa_HiDa/split_train.json`
-- masked L1 loss with paper-style normalization: `sum(|pred-gt|*M)/(C*sum(M))`
-- training augmentation enabled by default (random rotation, scale, translation, horizontal flip)
+## 1. 基础命令
 
-## 2. Choose backbone
+```bash
+pixi run python -m scripts.train.train_hisa
+```
+
+该脚本默认使用以下配置：
+- 数据集根目录: `./datasets/HiSa_HiDa`
+- 训练集拆分配置: `./datasets/HiSa_HiDa/split_train.json`
+- 掩蔽的 L1 损失（采用论文风格的归一化）: `sum(|pred-gt|*M)/(C*sum(M))`
+- 默认开启训练数据增强（随机旋转、缩放、平移、水平翻转）
+
+## 2. 选择主干网络 (Backbone)
 
 ### U-Net
 
 ```bash
-pixi run python -m scripts.train_hisa --img2strand_backbone unet
+pixi run python -m scripts.train.train_hisa --img2strand_backbone unet
 ```
 
 ### HRNet (timm)
 
 ```bash
-pixi run python -m scripts.train_hisa --img2strand_backbone hrnet --hrnet_variant hrnet_w18
+pixi run python -m scripts.train.train_hisa --img2strand_backbone hrnet --hrnet_variant hrnet_w18
 ```
 
-Supported HRNet variants:
+支持的 HRNet 变体：
 - `hrnet_w18`
 - `hrnet_w32`
 - `hrnet_w48`
 
-Use ImageNet pretrained weights:
+使用 ImageNet 预训练权重：
 
 ```bash
-pixi run python -m scripts.train_hisa \
+pixi run python -m scripts.train.train_hisa \
   --img2strand_backbone hrnet \
   --hrnet_variant hrnet_w32 \
   --hrnet_pretrained
 ```
 
-## 3. Checkpoint behavior
+## 3. 模型断点 (Checkpoint) 保存机制
 
-Checkpoints are saved by model tag to separate directories:
+断点将根据模型标签保存至不同的独立目录中：
 - U-Net: `./checkpoints/img2hairstep/unet/`
 - HRNet-W18: `./checkpoints/img2hairstep/hrnet_w18/`
 - HRNet-W32: `./checkpoints/img2hairstep/hrnet_w32/`
 - HRNet-W48: `./checkpoints/img2hairstep/hrnet_w48/`
 
-File naming:
+文件命名规则:
 - `img2strand_<model_tag>_epoch_<epoch>.pth`
 
-Example:
+示例:
 - `img2strand_hrnet_w18_epoch_50.pth`
 
-## 4. Resume training
+## 4. 恢复训练
 
-### A) Auto resume latest checkpoint in current model-tag directory
+### A) 自动恢复当前模型标签目录下的最新断点
 
 ```bash
-pixi run python -m scripts.train_hisa \
+pixi run python -m scripts.train.train_hisa \
   --img2strand_backbone hrnet \
   --hrnet_variant hrnet_w18 \
   --continue_train
 ```
 
-### B) Resume from a specific checkpoint path
+### B) 从指定断点路径恢复
 
 ```bash
-pixi run python -m scripts.train_hisa \
+pixi run python -m scripts.train.train_hisa \
   --img2strand_backbone hrnet \
   --hrnet_variant hrnet_w18 \
   --continue_train \
@@ -105,10 +104,10 @@ pixi run python -m scripts.train_hisa \
   --resume_epoch 200
 ```
 
-## 5. Common training controls
+## 5. 常用训练参数控制
 
 ```bash
-pixi run python -m scripts.train_hisa \
+pixi run python -m scripts.train.train_hisa \
   --img2strand_backbone hrnet \
   --hrnet_variant hrnet_w18 \
   --batch_size 12 \
@@ -119,28 +118,28 @@ pixi run python -m scripts.train_hisa \
   --freq_save 20
 ```
 
-Main arguments:
-- `--batch_size`: training batch size
-- `--num_threads`: DataLoader workers
-- `--pin_memory`: enable pin memory for faster host-to-GPU copy
-- `--learning_rate`: Adam learning rate
-- `--num_epoch`: total epoch count
-- `--freq_save`: checkpoint save frequency
+主要参数说明:
+- `--batch_size`: 训练批次大小
+- `--num_threads`: DataLoader 的工作线程数
+- `--pin_memory`: 启用锁页内存 (pin memory) 以加快从主机到 GPU 的拷贝速度
+- `--learning_rate`: Adam 优化器学习率
+- `--num_epoch`: 训练总轮数
+- `--freq_save`: 断点保存频率
 
-## 6. High-VRAM tuning tips (48 GB GPU)
+## 6. 高显存 (48 GB GPU) 调优技巧
 
-Start from:
+起始配置：
 - `--batch_size 12 --num_threads 12 --pin_memory`
 
-If stable, try larger batch:
+如果训练稳定，可尝试增加批次大小：
 - `--batch_size 16`
 - `--batch_size 20`
 
-If out-of-memory happens, reduce in this order:
-1. decrease `--batch_size`
-2. decrease `--num_threads`
+如果发生显存不足 (OOM)，请按以下顺序减小参数：
+1. 减小 `--batch_size`
+2. 减小 `--num_threads`
 
-## 7. Notes
+## 7. 备注
 
-- `--hrnet_pretrained` needs to download pretrained weights from the model hub on first run.
-- If network is unstable, run once without `--hrnet_pretrained` to verify the training pipeline.
+- 首次运行时，使用 `--hrnet_pretrained` 需要从模型中心下载预训练权重。
+- 如果网络不稳定，可以尝试在不添加 `--hrnet_pretrained` 的情况下运行一次，以验证训练管线是否正常。

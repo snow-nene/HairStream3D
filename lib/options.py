@@ -119,7 +119,7 @@ class BaseOptions():
         parser.add_argument('--gamma', type=float, default=0.1, help='LR is multiplied by gamma on schedule.')
 
         # ---------------------------------------------------------------
-        # Reconstruction strategy selection (scripts/recon3D_strategy.py)
+        # Reconstruction strategy selection (scripts/recon_3d/recon3D_strategy.py)
         # ---------------------------------------------------------------
         g_recon = parser.add_argument_group('Reconstruction Strategy')
         g_recon.add_argument(

@@ -434,6 +434,7 @@ class LaplacePDEStrategy(BaseReconStrategy):
             is_surface = (mask_2d > 0.5) & (np.abs(vox_depth - surf_depth) < margin)
             is_hair    = (mask_2d > 0.5) & (vox_depth <= (surf_depth + margin))
             is_inner_surface = np.zeros_like(is_surface, dtype=bool)
+            is_back_outer = np.zeros_like(is_surface, dtype=bool)
 
         # ------------------------------------------------------------------
         # Step 3: Build the Laplace linear system and solve per component (Matrix-Free GPU)

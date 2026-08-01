@@ -1,33 +1,33 @@
-# Hair Generation Pipeline (Laplace PDE + RK4) Pitfalls and Solutions
+# 发丝生成管线 (Laplace PDE + RK4) 的陷阱与解决方案
 
-This document records the major pitfalls encountered and resolved during the development of the 3D hair generation pipeline using Laplace PDE orientation fields and 2D-driven RK4 integration.
+本文档记录了在使用拉普拉斯 (Laplace) PDE 方向场和 2D 驱动的 RK4 积分进行 3D 发丝生成管线开发过程中遇到的主要陷阱和解决方案。
 
-## 1. Out-of-Bounds Camera Projection in RK4
-**Issue:** The RK4 integrator would crash or produce `nan` values because strands growing beyond the 2D camera viewport resulted in UV coordinates outside `[-1, 1]`. When querying 2D maps (e.g., divergence, clustering maps), this caused array out-of-bounds errors or undefined behavior.
-**Solution:** Used `torch.nn.functional.grid_sample` with `padding_mode='border'` and `align_corners=True` to safely clamp UV queries. Also added safety clamps to pixel coordinate conversions:
+## 1. RK4 中相机投影越界
+**问题:** RK4 积分器崩溃或产生 `nan` 值，因为发丝生长超出 2D 相机视口会导致 UV 坐标超出 `[-1, 1]` 范围。当查询 2D 贴图（例如散度、聚类贴图）时，会引起数组越界错误或未定义行为。
+**解决方案:** 使用 `torch.nn.functional.grid_sample` 并设置 `padding_mode='border'` 和 `align_corners=True`，以安全地限制 UV 查询。同时为像素坐标转换添加安全限制：
 ```python
 px = np.clip(((uv[0] + 1.0) / 2.0 * W).astype(int), 0, W - 1)
 ```
 
-## 2. Hair Tip Oscillations (180° Loops) due to Unscaled Noise
-**Issue:** Generated strands looked like "noodles" with chaotic 180-degree loops near the hair tips.
-**Cause:** The Laplace PDE gradient magnitude drops to near zero at the hair tips (boundary condition sink). However, the divergence noise force was applied with a constant or strictly time-dependent weight. When the natural PDE growth force died out, the pure noise force took over, sending the strands spinning chaotically.
-**Solution:** The noise vector must be scaled by the magnitude of the PDE vector (`k_mag`). As the underlying PDE field fades out at the tip, the noise field fades with it proportionally, resulting in a natural stop without oscillation.
+## 2. 噪声未缩放导致的发梢震荡（180° 打结）
+**问题:** 生成的发丝像“面条”一样，在发梢附近出现混乱的 180 度打结。
+**原因:** 拉普拉斯 PDE 梯度幅度在发梢（边界条件汇点）处降至接近零。然而，散度噪声力是施加了一个恒定的或严格依赖时间的权重。当自然的 PDE 生长力消退时，纯噪声力接管，导致发丝混乱地旋转。
+**解决方案:** 噪声向量必须按 PDE 向量的幅度 (`k_mag`) 进行缩放。随着底层 PDE 场在发梢处消退，噪声场也随之成比例消退，从而实现自然停止而不发生震荡。
 
-## 3. Unnatural Tip Bending due to Constant Clustering Force
-**Issue:** Strands exhibited sharp 45°-90° bends at their very tips, aggressively snapping toward guide strands.
-**Cause:** Similar to the noise issue, the clustering pull (lerp toward `C_guide`) had a base weight of `0.005` that did not account for the strand's current growth momentum. When the PDE force hit zero at the tip, the clustering force became the sole driving factor, dragging the stalled tip sideways and increasing segment length artificially.
-**Solution:** The clustering `total_clump` weight was multiplied by `k_mag / 0.9` (clamped to `[0, 1]`). This ensures that clustering only applies while the hair is actively growing. When growth stalls at the tip, the clustering pull also smoothly decays to zero.
+## 3. 恒定聚类力导致的发梢不自然弯曲
+**问题:** 发丝在最末端出现 45°-90° 的急剧弯曲，且生硬地贴向引导发丝。
+**原因:** 与噪声问题类似，聚类拉力（向 `C_guide` 插值）具有 `0.005` 的基础权重，它没有考虑发丝当前的生长动量。当 PDE 力在发梢降至零时，聚类力成为唯一的驱动因素，将停滞的发梢横向拖拽，并人为增加了片段长度。
+**解决方案:** 将聚类 `total_clump` 权重乘以 `k_mag / 0.9`（并限制在 `[0, 1]` 范围内）。这确保了聚类仅在发丝活跃生长时起作用。当生长在发梢停滞时，聚类拉力也会平滑地衰减至零。
 
-## 4. Sharp Kinks at Hair Roots (Discretization Error)
-**Issue:** Strands had sharp, visible "kinks" (10°-15° abrupt angles) within the first 2-3 steps of growth from the scalp.
-**Cause:** The Laplace orientation field was solved on a relatively coarse `64x64x64` voxel grid (approx. 1.5cm per voxel). At the scalp boundary, the electric field (vector field) has high curvature. RK4 steps crossing voxel boundaries experienced drastic vector shifts under this coarse resolution.
-**Solution:** Increased the PDE and collision SDF volumetric resolution to `128x128x128` (approx. 3-4mm per voxel). The much denser grid provides a naturally smooth vector field transition, eliminating root kinks without needing post-process Gaussian smoothing.
+## 4. 发根处出现尖锐扭结（离散化误差）
+**问题:** 发丝在距离头皮的前 2-3 步生长范围内出现了尖锐、可见的“扭结”（10°-15° 的急剧角度）。
+**原因:** 拉普拉斯方向场是在相对粗糙的 `64x64x64` 体素网格（每体素约 1.5 厘米）上求解的。在头皮边界处，电场（向量场）具有高曲率。在这种粗糙分辨率下，跨越体素边界的 RK4 步长会经历剧烈的向量偏移。
+**解决方案:** 将 PDE 和碰撞 SDF 体积分辨率提高至 `128x128x128`（每体素约 3-4 毫米）。更密集的网格提供了自然平滑的向量场过渡，无需后续的高斯平滑处理即可消除发根扭结。
 
-## 5. Collision Normal Skew from Anisotropic Voxels
-**Issue:** Collision response (pushing strands out of the head SDF) sometimes pushed hair in slightly incorrect/skewed directions.
-**Cause:** The bounding box for the head is `X: [-0.3, 0.3], Y: [1.0, 2.0], Z: [-0.3, 0.3]`, making it a non-cube (0.6 x 1.0 x 0.6). Using `np.gradient(sdf, axis=...)` assumes unit spacing across all axes, which severely distorted the resulting normal vectors because `dx != dy`.
-**Solution:** Always compute explicit voxel spacing `dx, dy, dz` and pass it to gradient calculations:
+## 5. 各向异性体素导致碰撞法线倾斜
+**问题:** 碰撞响应（将发丝推出头部 SDF 外部）有时会将头发推向略微不正确/倾斜的方向。
+**原因:** 头部的边界盒为 `X: [-0.3, 0.3], Y: [1.0, 2.0], Z: [-0.3, 0.3]`，这是一个非立方体（0.6 x 1.0 x 0.6）。使用 `np.gradient(sdf, axis=...)` 会假设所有轴上的间距单位均为 1，这会严重扭曲计算出的法向量，因为 `dx != dy`。
+**解决方案:** 始终计算明确的体素间距 `dx, dy, dz`，并将其传递给梯度计算：
 ```python
 dx = (b_max[0] - b_min[0]) / (R - 1)
 dy = (b_max[1] - b_min[1]) / (R - 1)

@@ -50,13 +50,13 @@ You can switch the strand predictor backbone with runtime flags:
 
 ```
 # random initialization
-python -m scripts.train_hisa --img2strand_backbone hrnet --hrnet_variant hrnet_w18
+python -m scripts.train.train_hisa --img2strand_backbone hrnet --hrnet_variant hrnet_w18
 
 # ImageNet pretrained initialization
-python -m scripts.train_hisa --img2strand_backbone hrnet --hrnet_variant hrnet_w32 --hrnet_pretrained
+python -m scripts.train.train_hisa --img2strand_backbone hrnet --hrnet_variant hrnet_w32 --hrnet_pretrained
 
 # inference with HRNet checkpoint
-python -m scripts.img2strand --img2strand_backbone hrnet --hrnet_variant hrnet_w32 --checkpoint_img2strand ./checkpoints/img2hairstep/hrnet_w32_epoch_xxx.pth
+python -m scripts.infer_2d.img2strand --img2strand_backbone hrnet --hrnet_variant hrnet_w32 --checkpoint_img2strand ./checkpoints/img2hairstep/hrnet_w32_epoch_xxx.pth
 ```
 
 Supported HRNet variants: `hrnet_w18`, `hrnet_w32`, `hrnet_w48`.
@@ -68,10 +68,10 @@ Download the checkpoint of [SAM](https://dl.fbaipublicfiles.com/segment_anything
 
 Download checkpoints of [3D networks](https://drive.google.com/file/d/1-akuukaYYtJDta24AAqVdgUOGte4EmQf/view?usp=drive_link) and put them to ./checkpoints/recon3D/.
   ```
-  CUDA_VISIBLE_DEVICES=0 python -m scripts.img2hairstep
-  CUDA_VISIBLE_DEVICES=0 python scripts/get_lmk.py
-  CUDA_VISIBLE_DEVICES=0 python -m scripts.opt_cam
-  CUDA_VISIBLE_DEVICES=0 python -m scripts.recon3D
+  CUDA_VISIBLE_DEVICES=0 python -m scripts.infer_2d.img2hairstep
+  CUDA_VISIBLE_DEVICES=0 python scripts/utils/get_lmk.py
+  CUDA_VISIBLE_DEVICES=0 python -m scripts.utils.opt_cam
+  CUDA_VISIBLE_DEVICES=0 python -m scripts.recon_3d.recon3D
   ```
 Results will be saved in ./results/real_imgs/.
 

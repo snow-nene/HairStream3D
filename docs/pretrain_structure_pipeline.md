@@ -44,17 +44,17 @@ checkpoints/img2hairstep/hrnet_w32/  (最终模型)
 - `datasets/pretrain/seg/{hash}.png` — SAM 生成的头发区域 mask（0/255）
 
 ### 实现
-- `scripts/batch_generate_masks.py`
-- 复用 `scripts/img2masks.py` 的 `pad_and_resize` + `SamPredictor` 逻辑
+- `scripts/train/batch_generate_masks.py`
+- 复用 `scripts/infer_2d/img2masks.py` 的 `pad_and_resize` + `SamPredictor` 逻辑
 - 使用文件内容的 MD5 hash 作为文件名，避免重名
 
 ### 运行
 ```bash
 # 冒烟测试（仅 5 张）
-PYTHONPATH=. pixi run python scripts/batch_generate_masks.py --max_samples 5
+PYTHONPATH=. pixi run python scripts/train/batch_generate_masks.py --max_samples 5
 
 # 全量（48,252 张）
-PYTHONPATH=. pixi run python scripts/batch_generate_masks.py
+PYTHONPATH=. pixi run python scripts/train/batch_generate_masks.py
 ```
 
 ---
@@ -91,13 +91,13 @@ confidence = coherence × hair_mask
 | `resize_factor` | 0.5 | 处理分辨率缩放（512→256，加速） |
 
 ### 实现
-- `scripts/generate_structure_labels.py`
-- 批量调用 `scripts/standard_pipeline.py` 的 `extract_structure_field()`
+- `scripts/train/generate_structure_labels.py`
+- 批量调用 `scripts/infer_2d/standard_pipeline.py` 的 `extract_structure_field()`
 - 输出 `strand_map/` 和 `confidence/` 目录
 
 ### 运行
 ```bash
-PYTHONPATH=. pixi run python scripts/generate_structure_labels.py \
+PYTHONPATH=. pixi run python scripts/train/generate_structure_labels.py \
   --input_dir datasets/pretrain \
   --output_dir datasets/pretrain
 ```
@@ -132,13 +132,13 @@ PYTHONPATH=. pixi run python scripts/generate_structure_labels.py \
 | 保存频率 | 每 10 epoch |
 
 ### 实现
-- `scripts/pretrain_structure.py`
+- `scripts/train/pretrain_structure.py`
 - 新建 `PretrainDataset` 类，返回 `(rgb_img, strand_gt, mask, confidence)`
 - 每 epoch 检查 `current_epoch` 动态更新 `confidence_threshold`
 
 ### 运行
 ```bash
-PYTHONPATH=. pixi run python scripts/pretrain_structure.py \
+PYTHONPATH=. pixi run python scripts/train/pretrain_structure.py \
   --img2strand_backbone hrnet --hrnet_variant hrnet_w32 --hrnet_pretrained \
   --num_epoch 90
 ```
@@ -150,7 +150,7 @@ PYTHONPATH=. pixi run python scripts/pretrain_structure.py \
 加载预训练 checkpoint，在 1,054 张标注数据上微调：
 
 ```bash
-PYTHONPATH=. pixi run python scripts/train_hisa.py \
+PYTHONPATH=. pixi run python scripts/train/train_hisa.py \
   --img2strand_backbone hrnet --hrnet_variant hrnet_w32 \
   --continue_train \
   --checkpoint_img2strand ./checkpoints/pretrain/hrnet_w32/img2strand_hrnet_w32_epoch_89.pth \
@@ -168,10 +168,10 @@ PYTHONPATH=. pixi run python scripts/train_hisa.py \
 | 文件 | 操作 | 说明 |
 |------|:---:|------|
 | `docs/pretrain_structure_pipeline.md` | 新建 | 本文档 |
-| `scripts/batch_generate_masks.py` | 新建 | 批量 SAM 抠图 |
-| `scripts/generate_structure_labels.py` | 新建 | 批量结构张量提取 |
-| `scripts/pretrain_structure.py` | 新建 | 预训练脚本 + 置信度调度 + PretrainDataset |
-| `scripts/standard_pipeline.py` | 不改 | 已有 `extract_structure_field()` |
+| `scripts/train/batch_generate_masks.py` | 新建 | 批量 SAM 抠图 |
+| `scripts/train/generate_structure_labels.py` | 新建 | 批量结构张量提取 |
+| `scripts/train/pretrain_structure.py` | 新建 | 预训练脚本 + 置信度调度 + PretrainDataset |
+| `scripts/infer_2d/standard_pipeline.py` | 不改 | 已有 `extract_structure_field()` |
 | `lib/model/img2hairstep/criterion/hairstep_losses.py` | 小改 | 新增 `confidence_mask` 参数 |
 | 其他现有文件 | 不改 | 完全兼容 |
 
