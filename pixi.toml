@@ -42,3 +42,21 @@ gradio = "==2.9.4"
 trimesh = "==3.9.36"
 open3d = ">=0.18.0, <0.19"
 taichi = ">=1.7.4, <2"
+
+[tasks]
+# 流水线命令
+pipeline = "bash scripts/run_pipeline.sh"
+pipeline-front = "bash scripts/run_pipeline.sh --views front"
+
+# 2D 推理
+infer-2d = "python scripts/infer_2d/img2hairstep.py"
+flux-redraw = "python scripts/infer_2d/flux_redraw_multiview.py"
+
+# 3D 求解与像素提取
+run-pde = "python scripts/recon_3d/run_pde_multiview.py"
+compute-maps = "python scripts/render/compute_multiview_maps.py"
+
+# 标定与可视化
+opt-cam = "python scripts/utils/opt_cam.py"
+vis-align = "python scripts/utils/vis_calib_alignment.py"
+

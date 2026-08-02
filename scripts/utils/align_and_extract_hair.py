@@ -40,7 +40,7 @@ def main():
     print("\n[Step 1] 调用 Blender 渲染正面视图...")
     render_cmd = [
         "conda", "run", "-n", "trellis2",
-        "blender", "--background", "--python", "scripts/render/render_glb_front.py", "--",
+        "blender", "--background", "--factory-startup", "--python", "scripts/render/render_glb_front.py", "--",
         "--glb", glb_path,
         "--out_dir", os.path.abspath(args.out_dir)
     ]

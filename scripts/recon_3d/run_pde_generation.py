@@ -154,7 +154,7 @@ def main():
     parser.add_argument("--out_ply", default="results/test_pde_rk4/hair_mv_256.ply")
     parser.add_argument("--roots", default="data/roots10k.obj", help="Path to roots obj file")
     parser.add_argument("--pde_resolution", type=int, default=256, help="PDE resolution")
-    parser.add_argument("--min_len", type=float, default=0.05, help="Minimum physical length threshold (in meters) to prune short strands")
+    parser.add_argument("--min_len", type=float, default=0.0, help="Minimum physical length threshold (in meters) to prune short strands, 0.0 to disable")
     args = parser.parse_args()
 
     os.makedirs(os.path.dirname(args.out_ply), exist_ok=True)

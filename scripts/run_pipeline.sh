@@ -220,7 +220,7 @@ if run_stage "render"; then
         echo "错误: 找不到 3D 基础网格文件 $GLB_PATH，请先完成 pixal3d 阶段。"
         exit 1
     fi
-    blender -b -P scripts/render/render_multiview_blender.py -- \
+    blender -b --factory-startup -P scripts/render/render_multiview_blender.py -- \
         --glb "$GLB_PATH" \
         --out_dir "${DATA_DIR}/blender_renders" \
         --size 512 \
@@ -302,7 +302,7 @@ if run_stage "preview"; then
     if [ ! -f "$PLY_PATH" ]; then
         echo "警告: 未找到 $PLY_PATH，跳过预览阶段。"
     else
-        blender -b assets/render_template.blend -P scripts/render/render_blender.py -- \
+        blender -b --factory-startup assets/render_template.blend -P scripts/render/render_blender.py -- \
             --hair_path "$PLY_PATH" \
             --save_blend "${DATA_DIR}/pde_reconstruction/scene_with_hair.blend" \
             --output_path "${DATA_DIR}/pde_reconstruction/preview.png"

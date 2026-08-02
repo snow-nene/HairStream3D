@@ -58,10 +58,10 @@ def hair_synthesis_DSH(net, cuda, root_tensor, calib_tensor, num_sample=100, hai
 
     return hair_strands.permute(2, 0, 1).cpu().detach().numpy()
 
-def save_strands_with_mesh(strands, mesh_path, outputpath, err=0.3, is_eval=False, min_len=0.05):
+def save_strands_with_mesh(strands, mesh_path, outputpath, err=0.3, is_eval=False, min_len=0.0):
     """
-    保存生成的 3D 发丝 PLY 模型，并增加自动修剪/过滤过短发丝的功能。
-    min_len (float): 发丝最小物理长度限制（单位：米，默认 0.05m = 5cm），低于此长度的发丝将被自动修剪/滤除。
+    保存生成的 3D 发丝 PLY 模型。
+    min_len (float): 发丝最小物理长度限制（单位：米，默认 0.0m = 不修剪），低于此长度的发丝将被修剪/滤除。
     """
     lst_pc_all_valid = []
     lst_num_pt = []
@@ -80,7 +80,7 @@ def save_strands_with_mesh(strands, mesh_path, outputpath, err=0.3, is_eval=Fals
         total_length = np.sum(segment_lengths)
         
         # 过滤/修剪过短的发丝（如物理长度 < min_len）
-        if total_length < min_len:
+        if min_len > 0.0 and total_length < min_len:
             continue
 
         num_pt = 0
