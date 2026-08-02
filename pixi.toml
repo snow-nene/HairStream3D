@@ -44,7 +44,11 @@ open3d = ">=0.18.0, <0.19"
 taichi = ">=1.7.4, <2"
 
 [tasks]
-# 流水线命令
+# 默认回归测试（硬编码常用测试图 0a1ba3dbefc8934ab60577c5c91f66a0，无需输入任何参数）
+test = "bash scripts/run_pipeline.sh --img_id 0a1ba3dbefc8934ab60577c5c91f66a0"
+test-front = "bash scripts/run_pipeline.sh --views front --img_id 0a1ba3dbefc8934ab60577c5c91f66a0"
+
+# 通用流水线命令（支持传入自定义图片路径或 ID）
 pipeline = "bash scripts/run_pipeline.sh"
 pipeline-front = "bash scripts/run_pipeline.sh --views front"
 

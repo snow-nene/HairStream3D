@@ -29,6 +29,7 @@ STAGES=()
 VIEWS=("front" "left" "right" "back")
 
 # 参数解析
+POSITIONAL_ARGS=()
 while [[ "$#" -gt 0 ]]; do
     case $1 in
         --img_id) IMG_ID="$2"; shift ;;
@@ -50,13 +51,51 @@ while [[ "$#" -gt 0 ]]; do
             done
             continue
             ;;
-        *) echo "未知参数: $1"; exit 1 ;;
+        -*) echo "未知参数: $1"; exit 1 ;;
+        *) POSITIONAL_ARGS+=("$1") ;;
     esac
     shift
 done
 
+# 如果通过位置参数传了路径或 ID
+if [ ${#POSITIONAL_ARGS[@]} -gt 0 ]; then
+    ARG0="${POSITIONAL_ARGS[0]}"
+    if [ -f "$ARG0" ]; then
+        RAW_IMG="$ARG0"
+    elif [ -f "results/real_imgs/${ARG0}" ]; then
+        RAW_IMG="results/real_imgs/${ARG0}"
+    elif [ -f "results/real_imgs/${ARG0}.png" ]; then
+        RAW_IMG="results/real_imgs/${ARG0}.png"
+    elif [ -f "results/real_imgs/${ARG0}.jpg" ]; then
+        RAW_IMG="results/real_imgs/${ARG0}.jpg"
+    else
+        # 假设其为 IMG_ID
+        if [ -z "$IMG_ID" ]; then
+            IMG_ID="$ARG0"
+        fi
+    fi
+fi
+
+# 如果未显式提供 --img_id，但提供了 --raw_img，自动从文件名中提取 img_id
+if [ -z "$IMG_ID" ] && [ -n "$RAW_IMG" ]; then
+    filename=$(basename "$RAW_IMG")
+    IMG_ID="${filename%.*}"
+    echo "[INFO] 自动从 --raw_img 提取 img_id: $IMG_ID"
+fi
+
+# 如果已知 --img_id 但未提供 --raw_img，自动在 results/real_imgs 下查找匹配图片
+if [ -n "$IMG_ID" ] && [ -z "$RAW_IMG" ]; then
+    for ext in png jpg jpeg PNG JPG; do
+        if [ -f "results/real_imgs/${IMG_ID}.${ext}" ]; then
+            RAW_IMG="results/real_imgs/${IMG_ID}.${ext}"
+            echo "[INFO] 自动推导 raw_img 路径: $RAW_IMG"
+            break
+        fi
+    done
+fi
+
 if [ -z "$IMG_ID" ]; then
-    echo "错误: 必须提供 --img_id 参数。"
+    echo "错误: 必须提供 --img_id 参数 (或提供 --raw_img 图片路径)。"
     echo "用法: $0 --img_id <id> [--raw_img <path>] [--views front left ...] [--stages stage1 ...]"
     exit 1
 fi
