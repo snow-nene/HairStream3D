@@ -26,12 +26,22 @@
 IMG_ID=""
 RAW_IMG=""
 STAGES=()
+VIEWS=("front" "left" "right" "back")
 
 # 参数解析
 while [[ "$#" -gt 0 ]]; do
     case $1 in
         --img_id) IMG_ID="$2"; shift ;;
         --raw_img) RAW_IMG="$2"; shift ;;
+        --views)
+            shift
+            VIEWS=()
+            while [[ "$#" -gt 0 && ! "$1" == "--"* ]]; do
+                VIEWS+=("$1")
+                shift
+            done
+            continue
+            ;;
         --stages)
             shift
             while [[ "$#" -gt 0 && ! "$1" == "--"* ]]; do
@@ -47,7 +57,7 @@ done
 
 if [ -z "$IMG_ID" ]; then
     echo "错误: 必须提供 --img_id 参数。"
-    echo "用法: $0 --img_id <id> [--stages stage1 stage2 ...]"
+    echo "用法: $0 --img_id <id> [--raw_img <path>] [--views front left ...] [--stages stage1 ...]"
     exit 1
 fi
 
@@ -102,6 +112,10 @@ if run_stage "prepare"; then
     cp "${TMP_DIR}/depth_map/front.npy" "${DATA_DIR}/maps/depth_map/"
     cp "${TMP_DIR}/resized_img/front.png" "${DATA_DIR}/blender_renders/" # 作为基准正面渲染图
     
+    if [ -d "${TMP_DIR}/param" ]; then
+        cp -r "${TMP_DIR}/param/"* "${DATA_DIR}/maps/param/"
+    fi
+    
     # 保留原始图路径供 align_calib 阶段使用
     echo "$RAW_IMG" > "${DATA_DIR}/raw_img_path.txt"
     
@@ -133,53 +147,73 @@ fi
 
 if run_stage "align_calib"; then
     echo "=========================================="
-    echo " [1.8/5] AlignCalib: lmk 对齐 → 生成相机标定 front.npy"
+    echo " [1.8/5] AlignCalib: 区分保存原图标定 front.npy 与 GLB 模型标定 glb_param.npy"
     echo "=========================================="
-    RENDER_IMG="${DATA_DIR}/pixal3d/render_front.png"
-    RENDER_CAM="${DATA_DIR}/pixal3d/render_camera.npz"
-    HAIR_OBJ="${DATA_DIR}/pixal3d/hair_mesh_aligned_best.obj"
-    STRAND_MAP="${DATA_DIR}/maps/strand_map/front.png"
     PARAM_OUT="${DATA_DIR}/maps/param"
+    mkdir -p "$PARAM_OUT"
 
-    if [ ! -f "$RENDER_IMG" ] || [ ! -f "$RENDER_CAM" ]; then
-        echo "错误: 找不到渲染图或相机参数 ($RENDER_IMG / $RENDER_CAM)。"
-        echo "      请先完成 extract 阶段 (align_and_extract_hair.py 会生成这两个文件)。"
-        exit 1
-    fi
-
-    # 读取原始输入图路径 (prepare 阶段写入)
+    # 读取原始输入图路径
     if [ -f "${DATA_DIR}/raw_img_path.txt" ]; then
         INPUT_IMG=$(cat "${DATA_DIR}/raw_img_path.txt")
     elif [ -n "$RAW_IMG" ]; then
         INPUT_IMG="$RAW_IMG"
-    else
-        # fallback: 用 blender_renders/front.png (已对齐的渲染结果)
-        INPUT_IMG="${DATA_DIR}/blender_renders/front.png"
-        echo "  [WARN] 未找到原始图路径，使用渲染图作为输入: $INPUT_IMG"
     fi
 
-    mkdir -p "$PARAM_OUT"
-    pixi run python scripts/utils/align_glb_lmk.py \
-        --input_img  "$INPUT_IMG" \
-        --render_img "$RENDER_IMG" \
-        --render_cam "$RENDER_CAM" \
-        --glb_ply    "$HAIR_OBJ" \
-        --strand_map "$STRAND_MAP" \
-        --out_dir    "$PARAM_OUT"
-
-    # align_glb_lmk.py 输出为 glb_param.npy，重命名为 front.npy
-    if [ -f "${PARAM_OUT}/glb_param.npy" ]; then
-        mv "${PARAM_OUT}/glb_param.npy" "${PARAM_OUT}/front.npy"
-        echo "  ✓ 相机标定已保存: ${PARAM_OUT}/front.npy"
+    # 1. 确保原始图片对应的校准矩阵 front.npy 存在且不被覆盖
+    if [ ! -f "${PARAM_OUT}/front.npy" ]; then
+        echo "  --> 正在生成原始输入图的校准矩阵 maps/param/front.npy..."
+        if [ -n "$INPUT_IMG" ] && [ -f "$INPUT_IMG" ]; then
+            # 建立 opt_cam 期望的临时图像目录
+            TMP_OPT="${DATA_DIR}/tmp_opt"
+            mkdir -p "${TMP_OPT}/resized_img" "${TMP_OPT}/lmk"
+            cp "$INPUT_IMG" "${TMP_OPT}/resized_img/front.png"
+            
+            # 检测关键点并优化标定
+            PYTHONPATH=. pixi run python scripts/utils/get_lmk.py --root_real_imgs "$TMP_OPT"
+            PYTHONPATH=. pixi run python scripts/utils/opt_cam.py --root_real_imgs "$TMP_OPT"
+            
+            if [ -f "${TMP_OPT}/param/front.npy" ]; then
+                cp "${TMP_OPT}/param/front.npy" "${PARAM_OUT}/front.npy"
+            fi
+            rm -rf "$TMP_OPT"
+        fi
     else
-        echo "  [ERROR] align_glb_lmk.py 未生成 glb_param.npy，请检查！"
-        exit 1
+        echo "  ✓ 原始输入图标定已存在: ${PARAM_OUT}/front.npy"
     fi
+
+    # 2. 运行 align_glb_lmk.py 生成 Pixal3D GLB 模型专属的 glb_param.npy
+    RENDER_IMG="${DATA_DIR}/pixal3d/render_front.png"
+    RENDER_CAM="${DATA_DIR}/pixal3d/render_camera.npz"
+    HAIR_OBJ="${DATA_DIR}/pixal3d/hair_mesh_aligned_best.obj"
+    STRAND_MAP="${DATA_DIR}/maps/strand_map/front.png"
+
+    if [ -f "$RENDER_IMG" ] && [ -f "$RENDER_CAM" ] && [ -f "$HAIR_OBJ" ]; then
+        echo "  --> 正在计算 Pixal3D 模型专属标定矩阵 maps/param/glb_param.npy..."
+        pixi run python scripts/utils/align_glb_lmk.py \
+            --input_img  "${INPUT_IMG:-${DATA_DIR}/blender_renders/front.png}" \
+            --render_img "$RENDER_IMG" \
+            --render_cam "$RENDER_CAM" \
+            --glb_ply    "$HAIR_OBJ" \
+            --strand_map "$STRAND_MAP" \
+            --out_dir    "$PARAM_OUT"
+
+        if [ -f "${PARAM_OUT}/glb_param.npy" ]; then
+            echo "  ✓ GLB 模型专属标定已保存: ${PARAM_OUT}/glb_param.npy"
+        else
+            echo "  [ERROR] align_glb_lmk.py 未生成 glb_param.npy，请检查！"
+            exit 1
+        fi
+    fi
+
+    # 3. 运行对齐效果可视化，生成 real_face_alignment.png 供检查
+    pixi run python scripts/utils/vis_calib_alignment.py \
+        --img_id "$IMG_ID" \
+        --out_dir "$PARAM_OUT"
 fi
 
 if run_stage "render"; then
     echo "=================================================="
-    echo " [2/5] Render: Blender 多视角渲染"
+    echo " [2/5] Render: Blender 多视角渲染 (${VIEWS[*]})"
     echo "=================================================="
     GLB_PATH="${DATA_DIR}/pixal3d/${IMG_ID}.glb"
     if [ ! -f "$GLB_PATH" ]; then
@@ -189,10 +223,11 @@ if run_stage "render"; then
     blender -b -P scripts/render/render_multiview_blender.py -- \
         --glb "$GLB_PATH" \
         --out_dir "${DATA_DIR}/blender_renders" \
-        --size 512
+        --size 512 \
+        --views "${VIEWS[@]}"
         
-    # Rename left_rgb, right_rgb, back_rgb to left, right, back so downstream scripts find them
-    for v in left right back; do
+    # Rename *_rgb.png to standard view names
+    for v in "${VIEWS[@]}"; do
         if [ -f "${DATA_DIR}/blender_renders/${v}_rgb.png" ]; then
             mv "${DATA_DIR}/blender_renders/${v}_rgb.png" "${DATA_DIR}/blender_renders/${v}.png"
         fi
@@ -201,43 +236,61 @@ fi
 
 if run_stage "flux"; then
     echo "=================================================="
-    echo " [3/5] FLUX.2: 多视角发丝重绘增强"
+    echo " [3/5] FLUX.2: 多视角发丝重绘增强 (${VIEWS[*]})"
     echo "=================================================="
     pixi run python scripts/infer_2d/flux_redraw_multiview.py \
         --img_id "$IMG_ID" \
-        --views front left right back
+        --views "${VIEWS[@]}"
 fi
 
 if run_stage "maps"; then
     echo "=================================================="
-    echo " [4/5] Maps: 提取多视角 2D 特征图"
+    echo " [4/5] Maps: 提取多视角 2D 特征图 (${VIEWS[*]})"
     echo "=================================================="
-    # 提取特征需要基准的正面图片信息 (在生成多视角前需存在)
     FRONT_IMG="${DATA_DIR}/blender_renders/front.png"
     FRONT_STRAND="${DATA_DIR}/maps/strand_map/front.png"
     FRONT_DEPTH="${DATA_DIR}/maps/depth_map/front.npy"
     
-    # 兼容原脚本的参数
-    pixi run python scripts/render/compute_multiview_maps.py \
-        --front_img "$FRONT_IMG" \
-        --front_strand "$FRONT_STRAND" \
-        --front_depth "$FRONT_DEPTH" \
-        --render_dir "${DATA_DIR}/flux_redrawn" \
-        --out_dir "${DATA_DIR}/maps" \
-        --views left right back
+    # 筛选出除 front 之外的其他侧视角
+    OTHER_VIEWS=()
+    for v in "${VIEWS[@]}"; do
+        if [ "$v" != "front" ]; then
+            OTHER_VIEWS+=("$v")
+        fi
+    done
+
+    if [ ${#OTHER_VIEWS[@]} -gt 0 ]; then
+        pixi run python scripts/render/compute_multiview_maps.py \
+            --front_img "$FRONT_IMG" \
+            --front_strand "$FRONT_STRAND" \
+            --front_depth "$FRONT_DEPTH" \
+            --render_dir "${DATA_DIR}/flux_redrawn" \
+            --out_dir "${DATA_DIR}/maps" \
+            --views "${OTHER_VIEWS[@]}"
+    else
+        echo "  [INFO] 仅选择正面 front 视角，跳过侧面特征图提取。"
+    fi
 fi
 
 if run_stage "pde"; then
     echo "=================================================="
     echo " [5/6] PDE: 3D 融合解算 (生成毛发)"
     echo "=================================================="
-    # 若要跑单视角，直接不加 --expand-multiview。在脚本这里为了演示多视角流程默认加上了。
-    # 也可以专门运行 python scripts/recon_3d/run_pde_multiview.py --img_id "$IMG_ID" 跑单视角
-    pixi run python scripts/recon_3d/run_pde_multiview.py \
-        --img_id "$IMG_ID" \
-        --pde_resolution 384 \
-        --pde_dilation_iters 25 \
-        --expand-multiview
+    PDE_ARGS=("--img_id" "$IMG_ID" "--pde_resolution" "384" "--pde_dilation_iters" "25")
+    
+    # 如果包含侧视角，开启多视角扩展
+    OTHER_VIEWS_COUNT=0
+    for v in "${VIEWS[@]}"; do
+        if [ "$v" != "front" ]; then
+            OTHER_VIEWS_COUNT=$((OTHER_VIEWS_COUNT + 1))
+        fi
+    done
+
+    if [ $OTHER_VIEWS_COUNT -gt 0 ]; then
+        PDE_ARGS+=("--views" "${VIEWS[@]}")
+    fi
+
+    pixi run python scripts/recon_3d/run_pde_multiview.py "${PDE_ARGS[@]}"
 fi
 
 if run_stage "preview"; then
@@ -249,8 +302,9 @@ if run_stage "preview"; then
     if [ ! -f "$PLY_PATH" ]; then
         echo "警告: 未找到 $PLY_PATH，跳过预览阶段。"
     else
-        blender -b -P scripts/render/render_blender.py -- \
+        blender -b assets/render_template.blend -P scripts/render/render_blender.py -- \
             --hair_path "$PLY_PATH" \
+            --save_blend "${DATA_DIR}/pde_reconstruction/scene_with_hair.blend" \
             --output_path "${DATA_DIR}/pde_reconstruction/preview.png"
     fi
 fi

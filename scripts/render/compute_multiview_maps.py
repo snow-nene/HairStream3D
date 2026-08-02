@@ -212,16 +212,15 @@ def predict_depth(model, rgb_img, hair_mask, device):
 
 
 def depth2vis(mask, depth, path_output):
-    """Jet-colormap depth visualization."""
+    """Jet-colormap depth visualization without writing temporary files."""
     m = mask[:, :, 0].astype(np.float32)
     masked = depth * m + (1 - m) * ((depth * m).max())
     norm = masked / (np.nanmax(masked) - np.nanmin(masked) + 1e-8)
-    plt.imsave("_tmp_d.png", norm, cmap="jet")
-    vis = imageio.imread("_tmp_d.png")[:, :, 0:3]
-    vis = (vis.astype(np.float32) * mask[:, :, None]).astype(np.uint8)
+    
+    cm = plt.get_cmap("jet")
+    colored = (cm(norm)[:, :, :3] * 255).astype(np.uint8)
+    vis = (colored.astype(np.float32) * mask[:, :, :3]).astype(np.uint8)
     plt.imsave(path_output, vis)
-    if os.path.exists("_tmp_d.png"):
-        os.remove("_tmp_d.png")
 
 
 def load_image(path):

@@ -8,6 +8,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--glb",    required=True)
 parser.add_argument("--out_dir",required=True)
 parser.add_argument("--size",   type=int, default=512)
+parser.add_argument("--views",  nargs="*", default=["front", "back", "left", "right", "top"])
 args = parser.parse_args(argv)
 
 os.makedirs(args.out_dir, exist_ok=True)
@@ -85,6 +86,8 @@ scene.render.image_settings.file_format = 'PNG'
 scene.render.image_settings.color_mode = 'RGBA'
 
 for view_name, offset in views.items():
+    if view_name not in args.views:
+        continue
     cam_pos = mathutils.Vector((
         float(center[0]) + offset[0],
         float(center[1]) + offset[1],

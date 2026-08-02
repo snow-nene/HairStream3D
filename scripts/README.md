@@ -36,6 +36,7 @@ This directory contains all the utility, training, inference, rendering, and tes
 
 - **`utils/`**: General utilities and geometry alignments.
   - `align_and_extract_hair.py`, `align_mesh_to_head.py`, `align_glb_lmk.py`: Scripts handling hair and mesh alignment.
+  - `vis_calib_alignment.py`: Visualizes 3D head mesh projection overlay on input image for calibration check.
   - `find_best_axis.py`: Utilities for finding best alignment axes.
   - `fix_calib_and_proj.py`: Fix calibration/projection matrices.
   - `get_lmk.py`: Extract landmarks.
