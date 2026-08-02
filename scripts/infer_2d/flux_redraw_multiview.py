@@ -69,7 +69,7 @@ def load_images(render_dir, view_names, size):
     loaded_views = []
 
     for v in view_names:
-        rgb_path = os.path.join(render_dir, f"{v}_rgb.png")
+        rgb_path = os.path.join(render_dir, f"{v}.png")
         if not os.path.exists(rgb_path):
             print(f"  [WARN] Missing render: {rgb_path}")
             continue
@@ -86,10 +86,8 @@ def main():
     parser = argparse.ArgumentParser(
         description="Multi-View Hair Inpainting with FLUX.2-klein"
     )
-    parser.add_argument("--render_dir", default="results/multi_view_blender",
-                        help="Directory with 5-view blender RGB renders")
-    parser.add_argument("--out_dir", default="results/multi_view_flux_multiview",
-                        help="Output directory")
+    parser.add_argument("--img_id", required=True,
+                        help="Image ID used for multiview_data directory")
     parser.add_argument("--views", nargs="+", default=VIEWS,
                         help="Views to process")
     parser.add_argument("--strength", type=float, default=0.8,
@@ -103,13 +101,17 @@ def main():
                         help="Path to FLUX.2-klein model")
     args = parser.parse_args()
 
-    os.makedirs(args.out_dir, exist_ok=True)
+    data_dir = os.path.join("results", "multiview_data", args.img_id)
+    render_dir = os.path.join(data_dir, "blender_renders")
+    out_dir = os.path.join(data_dir, "flux_redrawn")
+    os.makedirs(out_dir, exist_ok=True)
+    
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.float16
 
     # ── Load renders ────────────────────────────────────────────
-    print(f"Loading renders from: {args.render_dir}")
-    images, loaded_views = load_images(args.render_dir, args.views, args.size)
+    print(f"Loading renders from: {render_dir}")
+    images, loaded_views = load_images(render_dir, args.views, args.size)
     if len(images) == 0:
         print("[ERROR] No render+mask pairs found. Aborting.")
         sys.exit(1)
@@ -137,7 +139,7 @@ def main():
                 num_inference_steps=args.steps,
             ).images[0]
 
-        out_path = os.path.join(args.out_dir, f"{view}_hair.png")
+        out_path = os.path.join(out_dir, f"{view}.png")
         result.save(out_path)
         print(f"    Saved {out_path}")
 
@@ -146,17 +148,17 @@ def main():
         # Re-load the saved results for the grid
         grid_images = []
         for v in loaded_views:
-            p = os.path.join(args.out_dir, f"{v}_hair.png")
+            p = os.path.join(out_dir, f"{v}.png")
             if os.path.exists(p):
                 grid_images.append(Image.open(p).convert("RGB"))
 
         if len(grid_images) >= 3:
             grid = _make_grid(grid_images, loaded_views[:len(grid_images)])
-            grid_path = os.path.join(args.out_dir, "grid_overview.png")
+            grid_path = os.path.join(out_dir, "grid_overview.png")
             grid.save(grid_path)
             print(f"  Saved {grid_path}")
 
-    print(f"Done — {len(loaded_views)} views saved to {args.out_dir}")
+    print(f"Done — {len(loaded_views)} views saved to {out_dir}")
     print(f"Tip: lower --strength (e.g. 0.4) = keep hair closer to original")
     print(f"     higher --strength (e.g. 0.9) = more texture regeneration")
 

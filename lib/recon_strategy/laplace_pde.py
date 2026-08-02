@@ -238,6 +238,10 @@ class LaplacePDEStrategy(BaseReconStrategy):
         if mesh_path is not None:
             import kaolin
             import open3d as o3d
+            import os
+            if not os.path.exists(mesh_path):
+                print(f"[LaplacePDE] Warning: mesh_path '{mesh_path}' not found, falling back to 'data/head_model.obj'")
+                mesh_path = "data/head_model.obj"
             mesh = o3d.io.read_triangle_mesh(mesh_path)
             verts = torch.tensor(np.asarray(mesh.vertices), dtype=torch.float32, device=self.cuda)
             faces = torch.tensor(np.asarray(mesh.triangles), dtype=torch.int64, device=self.cuda)
@@ -253,7 +257,7 @@ class LaplacePDEStrategy(BaseReconStrategy):
             distance, _, _ = kaolin.metrics.trianglemesh.point_to_mesh_distance(pts_kaolin, face_vertices)
             distances_narrow = torch.sqrt(distance[0]).cpu().numpy()
             
-            del pts_kaolin, distance, face_vertices, verts, faces
+            del pts_kaolin, face_vertices, verts, faces
             torch.cuda.empty_cache()
             
             # Initialize global distance array to a large value (outside the narrow band)
@@ -364,6 +368,10 @@ class LaplacePDEStrategy(BaseReconStrategy):
         
         if mesh_path is not None:
             import open3d as o3d
+            import os
+            if not os.path.exists(mesh_path):
+                print(f"[LaplacePDE] Warning: mesh_path '{mesh_path}' not found, falling back to 'data/head_model.obj'")
+                mesh_path = "data/head_model.obj"
             mesh = o3d.io.read_triangle_mesh(mesh_path)
             mesh_t = o3d.t.geometry.TriangleMesh.from_legacy(mesh)
             scene = o3d.t.geometry.RaycastingScene()

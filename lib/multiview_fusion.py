@@ -22,78 +22,52 @@ from scipy.ndimage import gaussian_filter
 
 
 def build_blender_calib(view, center, extent):
-    """Build a 4×4 orthographic calibration matrix for a Blender camera view.
-
-    Uses a look-at approach: the camera is positioned at a distance from the
-    mesh center (matching render_multiview_blender.py) and always faces the
-    center.  The orthographic scale maps world units to NDC [-1, 1].
-
-    Args:
-        view:   "front" | "back" | "left" | "right"
-        center: (3,) float32, mesh center in world coords
-        extent: float, mesh bounding-box diagonal
-
-    Returns:
-        calib: (4, 4) float32, world → NDC [-1, 1]
+    """Build a 4×4 orthographic calibration matrix for a camera view.
+    Matches the exact projection logic of load_calib in recon3D.py,
+    where Y is up, +Z is front (face), and Y is inverted in projection.
     """
-    dist = extent * 2.0
-    scale = extent * 1.4  # ortho_scale
+    scale = 1.0
+    # The original model scale factor is roughly 256.0 / (extent * 1.4)
+    # But wait, loadSize/2 = 512 (for loadSize=1024), 
+    # To map world extent (0.3) to NDC [-1, 1], the scale factor is 1.0 / (extent * 1.4)
+    ortho_ratio = extent * 1.4
 
-    # Camera position (world coords)
-    positions = {
-        "front": np.array([0.0, +dist, 0.0]),
-        "back":  np.array([0.0, -dist, 0.0]),
-        "left":  np.array([-dist, 0.0, 0.0]),
-        "right": np.array([+dist, 0.0, 0.0]),
-    }
-    cam_pos = positions[view] + center  # world-space position
-
-    # ── Look-at rotation (world → camera) ────────────────────────
-    # Camera Z (forward): from camera toward center
-    forward = center - cam_pos
-    forward = forward / (np.linalg.norm(forward) + 1e-8)
-
-    # Camera Y (up): world Z (vertical, perpendicular to ground)
-    # For top view, use world X as up since forward is along Z
-    if view == "top":
-        world_up = np.array([0.0, 1.0, 0.0])
+    # Rotations for the 4 views. Front is Identity.
+    # We rotate the WORLD into CAMERA coordinates.
+    # Since front is Identity, Camera Z = World Z.
+    # For back, we look from the back (-Z), so we rotate 180 degrees around Y.
+    import math
+    if view == "front":
+        angles = [0.0, 0.0, 0.0]
+    elif view == "back":
+        angles = [0.0, math.pi, 0.0]
+    elif view == "left":
+        # Look from the left (+X). Rotate world by -90 deg around Y.
+        angles = [0.0, -math.pi / 2, 0.0]
+    elif view == "right":
+        # Look from the right (-X). Rotate world by 90 deg around Y.
+        angles = [0.0, math.pi / 2, 0.0]
     else:
-        world_up = np.array([0.0, 0.0, 1.0])
+        angles = [0.0, 0.0, 0.0]
 
-    # Camera X (right): cross(up, forward)
-    right = np.cross(world_up, forward)
-    right_norm = np.linalg.norm(right)
-    if right_norm < 1e-6:
-        # Degenerate: up parallel to forward
-        world_up = np.array([1.0, 0.0, 0.0])
-        right = np.cross(world_up, forward)
-    right = right / (np.linalg.norm(right) + 1e-8)
+    import scipy.spatial.transform as sst
+    R = sst.Rotation.from_euler('xyz', angles).as_matrix().astype(np.float32)
 
-    # Camera Y (up): cross(forward, right)
-    up = np.cross(forward, right)
-    up = up / (np.linalg.norm(up) + 1e-8)
+    translate = -np.matmul(R, center.reshape(3, 1))
+    extrinsic = np.concatenate([R, translate], axis=1)
+    extrinsic = np.concatenate([extrinsic, np.array([[0, 0, 0, 1]], dtype=np.float32)], 0)
 
-    # Rotation matrix: world → camera (row-major: R @ world = camera)
-    R = np.stack([right, up, forward], axis=0)  # (3, 3)
-    # R[i] = camera basis i expressed in world coords
-    # camera_coord_i = dot(R[i], world_pt - cam_pos)
-    T = -R @ cam_pos
+    # intrinsic
+    scale_intrinsic = np.identity(4, dtype=np.float32)
+    scale_intrinsic[0, 0] = scale / ortho_ratio
+    scale_intrinsic[1, 1] = -scale / ortho_ratio  # INVERT Y!
+    scale_intrinsic[2, 2] = scale / ortho_ratio
+    
+    calib_mat = np.matmul(scale_intrinsic, extrinsic)
+    
+    return calib_mat, R
 
-    # ── Orthographic NDC projection ──────────────────────────────
-    s = 2.0 / scale
-    P = np.array([
-        [s, 0, 0, 0],
-        [0, s, 0, 0],
-        [0, 0, 1, 0],
-        [0, 0, 0, 1],
-    ], dtype=np.float32)
 
-    RT = np.eye(4, dtype=np.float32)
-    RT[:3, :3] = R
-    RT[:3, 3] = T
-    calib = P @ RT
-
-    return calib, R  # calib=4x4 projection, R=3x3 pure rotation (world→cam)
 
 
 def decode_strand_2d(strand_map, px, py):
@@ -134,18 +108,30 @@ def decode_strand_2d(strand_map, px, py):
     return dx, dy, mask
 
 
-def backproject_direction(dx_2d, dy_2d, R_v, depth_grad):
+def backproject_direction(dx_2d, dy_2d, R_v, dz_dx, dz_dy):
     """Back-project a 2D strand direction into 3D world space.
 
     Args:
-        dx_2d, dy_2d: (N,) float32, 2D direction in image plane
+        dx_2d, dy_2d: (N,) float32, 2D direction in image plane (dx is right, dy is UP)
         R_v: (3, 3) float32, camera rotation matrix (world→cam)
-        depth_grad: (N,) float32, estimated z-component from depth gradient
+        dz_dx, dz_dy: (N,) float32, depth gradients at each pixel
 
     Returns:
         dir_3d: (N, 3) float32, normalized 3D direction in world space
     """
     N = len(dx_2d)
+
+    # In camera space, X and Y match dx_2d and dy_2d (since dy is already mapped to UP).
+    # The surface depth Z is a function of (x, y).
+    # The tangent vector in 3D along (dx, dy) has a Z component: dz = ∂Z/∂x * dx + ∂Z/∂y * dy
+    # Note: dz_dy from the image is based on image Y (down), but dy_2d is UP.
+    # We must be careful: if dy_2d is UP, it corresponds to a negative step in image Y.
+    # So dz from dy_2d is dz_dy * (-dy_2d).
+    # Wait, let's just use the exact math from LaplacePDEStrategy:
+    # strand_dz = strand_dx * dz_dx + strand_dy * dz_dy
+    # In LaplacePDEStrategy, strand_dy is UP (negated from image), and dz_dy is gradient along image Y (down).
+    # So the dot product actually works out exactly the same as LaplacePDEStrategy.
+    depth_grad = (dx_2d * dz_dx + dy_2d * dz_dy)
 
     # Camera-space direction
     d_cam = np.stack([dx_2d, dy_2d, depth_grad], axis=1)  # (N, 3)
@@ -165,18 +151,7 @@ def backproject_direction(dx_2d, dy_2d, R_v, depth_grad):
 
 
 def compute_depth_gradient(depth_map, px, py):
-    """Compute the 3D depth component along the 2D strand direction.
-
-    The depth gradient is the directional derivative of the depth map along
-    the strand direction, scaled to NDC units so it is comparable to the
-    dx_2d/dy_2d components (which are in [-1, 1] NDC).
-
-    Without proper scaling the vertical (Y) component of the 3D direction
-    is near zero, making hair strands grow sideways instead of downward.
-
-    Returns:
-        dz: (N,) float32, NDC-scaled depth component
-    """
+    from scipy.ndimage import gaussian_filter
     H, W = depth_map.shape
 
     # Smooth depth to get meaningful gradients at strand scale
@@ -191,9 +166,7 @@ def compute_depth_gradient(depth_map, px, py):
     dz_dx[idx] = (depth_smooth[py[idx], px[idx] + 1] - depth_smooth[py[idx], px[idx] - 1]) * 0.5
     dz_dy[idx] = (depth_smooth[py[idx] + 1, px[idx]] - depth_smooth[py[idx] - 1, px[idx]]) * 0.5
 
-    # NDC scaling: 1 NDC unit = 256 pixels (image is 512px mapping to [-1,1])
-    # Multiply dz per pixel by 256 to get dz in NDC-comparable units.
-    return (dz_dx + dz_dy) * 256.0
+    return dz_dx * 256.0, dz_dy * 256.0
 
 
 def fuse_multiview_orientation(
@@ -288,8 +261,8 @@ def fuse_multiview_orientation(
     is_surface_f = hair_f & (np.abs(vox_depth - surf_depth_f) < margin)
 
     # Back-project front 2D direction → 3D
-    depth_grad_f = compute_depth_gradient(depth_maps["front"], px_front, py_front)
-    dir_3d_f = backproject_direction(dx_f, dy_f, R_pure, depth_grad_f)
+    dz_dx_f, dz_dy_f = compute_depth_gradient(depth_maps["front"], px_front, py_front)
+    dir_3d_f = backproject_direction(dx_f, dy_f, R_pure, dz_dx_f, dz_dy_f)
 
     # Assign front direction where front can see
     idx_surf = np.where(is_surface_f)[0]
@@ -305,7 +278,8 @@ def fuse_multiview_orientation(
     print("[MultiviewFusion] Pass 2/2: Left/Right/Back (fill unseen)...")
     view_weights = {"left": 1.0, "right": 1.0, "back": 0.5}
 
-    for v in ["left", "right", "back"]:
+    valid_other_views = [v for v in ["left", "right", "back"] if v in calibs and v in strand_maps]
+    for v in valid_other_views:
         calib, R_pure = calibs[v]  # (calib_4x4, R_3x3)
         P3 = calib[:3, :3]
         t3 = calib[:3, 3:4]
@@ -335,8 +309,8 @@ def fuse_multiview_orientation(
             print(f"  {v}: 0 new voxels (all already covered)")
             continue
 
-        depth_grad_v = compute_depth_gradient(depth_maps[v], px, py)
-        dir_3d_v = backproject_direction(dx_v, dy_v, R_pure, depth_grad_v)
+        dz_dx_v, dz_dy_v = compute_depth_gradient(depth_maps[v], px, py)
+        dir_3d_v = backproject_direction(dx_v, dy_v, R_pure, dz_dx_v, dz_dy_v)
 
         w = view_weights[v]
         idx_fill = np.where(fill_mask)[0]

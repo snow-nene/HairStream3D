@@ -149,16 +149,28 @@ def main():
     o3d.io.write_triangle_mesh(aligned_out_path, raw_mesh)
     print(f"  对齐网格已保存至: {aligned_out_path}")
 
-    # ─── Step 5: SDF 头发网格提取 ───
-    print("\n[Step 5] 基于 3D SDF 提取头发表面网格...")
+    # ─── 保存 GLB → 世界坐标的组合变换 ───
+    # Umeyama: world_pt = c * R @ glb_pt + t
+    # ICP 在世界坐标内微调，变换矩阵为 reg_p2p.transformation [4x4]
+    # 合并后: world_pt = icp_T @ [c*R@glb_pt + t; 1]
+    # 保存供 align_glb_lmk.py 使用，将 GLB 坐标系的 calib 转换到世界坐标
+    glb_to_world_path = os.path.join(args.out_dir, "glb_to_world.npz")
+    np.savez(
+        glb_to_world_path,
+        umeyama_scale=np.array([c], dtype=np.float32),
+        umeyama_R=R.astype(np.float32),
+        umeyama_t=t.astype(np.float32),
+        icp_T=reg_p2p.transformation.astype(np.float32),
+    )
+    print(f"  GLB→世界坐标变换已保存: {glb_to_world_path}")
+
+    # ─── Step 5: FLAME 头发网格提取 ───
+    print("\n[Step 5] 基于 FLAME 模型提取头发表面网格...")
     out_sdf_path = os.path.join(args.out_dir, "hair_mesh_sdf.obj")
-    extract_hair_mesh_sdf(
+    from scripts.recon_3d.extract_hair_mesh_flame import extract_hair_mesh_flame
+    extract_hair_mesh_flame(
         aligned_mesh_path=aligned_out_path,
-        head_model_path=args.head,
-        out_path=out_sdf_path,
-        sdf_thresh=0.003,
-        back_sdf_thresh=-0.015,
-        neck_y_thresh=1.63
+        out_path=out_sdf_path
     )
     print("\n[完成] 头发网格对齐与提取全流程成功结束！")
 

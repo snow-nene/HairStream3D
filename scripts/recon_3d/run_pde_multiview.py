@@ -36,14 +36,18 @@ def main():
     parser = argparse.ArgumentParser(
         description="Multi-View 3D Hair PDE Synthesis"
     )
-    parser.add_argument("--strand_dir",
-                        default="results/multiview_strand_depth/strand_map")
-    parser.add_argument("--depth_dir",
-                        default="results/multiview_strand_depth/depth_map")
+    parser.add_argument("--img_id", required=True,
+                        help="Image ID used for multiview_data directory")
+    parser.add_argument("--views", nargs="*", default=["front"],
+                        help="List of views to use (default: front)")
+    parser.add_argument("--expand-multiview", action="store_true",
+                        help="If set, automatically load all available views (front, left, right, back)")
     parser.add_argument("--mesh_obj",
-                        default="results/test_pixal3d/hair_mesh_flame_extracted.obj")
-    parser.add_argument("--out_ply",
-                        default="results/multiview_pde/hair.ply")
+                        default=None,
+                        help="Mesh object to use for bounds (default fallback)")
+    parser.add_argument("--out_dir",
+                        default=None,
+                        help="Output directory (default: results/multiview_data/<img_id>/pde_reconstruction)")
     parser.add_argument("--roots",
                         default="data/roots10k.obj")
     parser.add_argument("--pde_resolution", type=int, default=256)
@@ -63,56 +67,153 @@ def main():
     parser.add_argument("--hair_unit", type=float, default=0.006)
     args = parser.parse_args()
 
-    os.makedirs(os.path.dirname(args.out_ply), exist_ok=True)
     cuda = torch.device("cuda:0")
+
+    data_dir = os.path.join("results", "multiview_data", args.img_id)
+    strand_dir = os.path.join(data_dir, "maps", "strand_map")
+    depth_dir = os.path.join(data_dir, "maps", "depth_map")
+    
+    out_dir = args.out_dir if args.out_dir else os.path.join(data_dir, "pde_reconstruction")
+    out_ply = os.path.join(out_dir, "hair_multiview.ply")
+    os.makedirs(out_dir, exist_ok=True)
 
     # ================================================================
     #  1. Load multi-view strand_maps + depth_maps
     # ================================================================
     print("=" * 60)
     print("Step 1: Loading multi-view data...")
-    views = ["front", "left", "right", "back"]
+    
+    if args.expand_multiview:
+        target_views = ["front", "left", "right", "back"]
+    else:
+        target_views = args.views
+
     strand_maps = {}
     depth_maps = {}
+    valid_views = []
 
-    for v in views:
-        sp = os.path.join(args.strand_dir, f"{v}.png")
-        dp = os.path.join(args.depth_dir, f"{v}.npy")
-
+    for v in target_views:
+        sp = os.path.join(strand_dir, f"{v}.png")
+        dp = os.path.join(depth_dir, f"{v}.npy")
+        
+        if not os.path.exists(sp) or not os.path.exists(dp):
+            print(f"  Warning: Missing strand or depth map for view '{v}'. Skipping.")
+            continue
+            
         strand_maps[v] = imageio.imread(sp).astype(np.float32) / 255.0
         depth_maps[v] = np.load(dp).astype(np.float32)
         print(f"  {v}: strand={strand_maps[v].shape}, depth={depth_maps[v].shape}")
+        valid_views.append(v)
+        
+    if "front" not in valid_views:
+        raise RuntimeError("Front view is required but missing.")
 
     # ================================================================
     #  2. Build camera calibration matrices
     # ================================================================
     print("\nStep 2: Building camera calibrations...")
 
-    # Load mesh to get extent & the REAL calib center
-    mesh = o3d.io.read_triangle_mesh(args.mesh_obj)
-    verts = np.asarray(mesh.vertices)
-    extent = (verts.max(axis=0) - verts.min(axis=0)).max()
-    print(f"  Mesh: {len(verts)} verts, extent={extent:.4f}")
+    b_min, b_max = np.array([1e5] * 3), np.array([-1e5] * 3)
+    
+    # ALWAYS include head_model.obj in bounding box (so roots in the back don't get clipped)
+    head_mesh_bbox = o3d.io.read_triangle_mesh("data/head_model.obj").get_axis_aligned_bounding_box()
+    b_min = np.minimum(b_min, head_mesh_bbox.get_min_bound())
+    b_max = np.maximum(b_max, head_mesh_bbox.get_max_bound())
+    
+    if args.mesh_obj is not None and os.path.exists(args.mesh_obj):
+        mesh = o3d.io.read_triangle_mesh(args.mesh_obj)
+        verts = np.asarray(mesh.vertices)
+        if len(verts) > 0:
+            extent = (verts.max(axis=0) - verts.min(axis=0)).max()
+        else:
+            print(f"[警告] {args.mesh_obj} 无法加载，退化为默认头部包围盒计算。")
+            extent = 0.3 # 默认尺寸
+            mesh = None
+    else:
+        print(f"[警告] 未找到 {args.mesh_obj}，退化为默认头部包围盒计算。")
+        extent = 0.3
+        mesh = None
+    print(f"  Mesh: {len(verts) if mesh else 0} verts, extent={extent:.4f}")
 
     # Load REAL front calibration — MUST match the strand_map coordinate system
     from scripts.recon_3d.recon3D import load_calib
-    front_calib_path = "results/real_imgs/param/0a1ba3dbefc8934ab60577c5c91f66a0.npy"
-    print(f"  Loading REAL front calib from: {front_calib_path}")
-    # Load param for rotation + center BEFORE building calibs
-    param = np.load(front_calib_path, allow_pickle=True).item()
+    front_calib_path = os.path.join(data_dir, "maps", "param", "front.npy")
+    if not os.path.exists(front_calib_path):
+        print(f"  [WARN] Missing front camera calibration: {front_calib_path}")
+        print(f"  [WARN] Falling back to dynamic front calibration.")
+        
+        import cv2
+        img = cv2.imread(os.path.join(strand_dir, "front.png"), cv2.IMREAD_UNCHANGED)
+        if img is None:
+            img = cv2.imread(os.path.join(data_dir, "maps", "strand", "front.png"), cv2.IMREAD_UNCHANGED)
+            
+        if img is not None:
+            mask = img[:, :, 2] > 0
+            y, x = np.where(mask)
+            if len(y) > 0:
+                px_min, px_max = x.min(), x.max()
+                py_min, py_max = y.min(), y.max()
+                
+                head_mesh_tmp = o3d.io.read_triangle_mesh(args.mesh_obj)
+                bbox = head_mesh_tmp.get_axis_aligned_bounding_box()
+                min_bound = bbox.get_min_bound()
+                max_bound = bbox.get_max_bound()
+                
+                X_min, X_max = min_bound[0], max_bound[0]
+                Y_min, Y_max = min_bound[1], max_bound[1]
+                Z_min, Z_max = min_bound[2], max_bound[2]
+                
+                W = img.shape[1]
+                H = img.shape[0]
+                
+                ortho_x = (X_max - X_min) / (px_max - px_min) * (W / 2)
+                ortho_y = (Y_max - Y_min) / (py_max - py_min) * (H / 2)
+                ortho_ratio = (ortho_x + ortho_y) / 2
+                
+                center_x = (X_max + X_min) / 2 - ((px_max + px_min) / (W / 2) - 2.0) * ortho_ratio / 2
+                center_y = Y_max + (py_min / (H/2) - 1.0) * ortho_ratio
+                center_z = (Z_max + Z_min) / 2
+                
+                b_center_tmp = np.array([center_x, center_y, center_z], dtype=np.float32)
+                extent = ortho_ratio / 1.4
+                print(f"  [INFO] Computed dynamic extent={extent:.4f}, center={b_center_tmp}")
+            else:
+                head_mesh_tmp = o3d.io.read_triangle_mesh(args.mesh_obj)
+                b_center_tmp = head_mesh_tmp.get_axis_aligned_bounding_box().get_center()
+                extent = 0.3
+        else:
+            head_mesh_tmp = o3d.io.read_triangle_mesh(args.mesh_obj)
+            b_center_tmp = head_mesh_tmp.get_axis_aligned_bounding_box().get_center()
+            extent = 0.3
+
+        param = {
+            'center': b_center_tmp.reshape(3, 1).astype(np.float32),
+            'R': np.eye(3, dtype=np.float32),
+            'scale': 1.0,
+            'ortho_ratio': 1.0
+        }
+        front_calib, _ = build_blender_calib("front", b_center_tmp, extent)
+    else:
+        print(f"  Loading REAL front calib from: {front_calib_path}")
+        param = np.load(front_calib_path, allow_pickle=True).item()
+        if 'ortho_ratio' in param:
+            extent = param['ortho_ratio'] / 1.4
+            print(f"  Updated extent from real ortho_ratio: {extent:.4f}")
+        front_calib = load_calib(front_calib_path, loadSize=1024)
+        if isinstance(front_calib, torch.Tensor):
+            front_calib = front_calib.numpy()
+
     real_center = param.get('center').flatten().astype(np.float32)
     R_real = param.get('R').astype(np.float32)
-    # Normalize rows — raw R includes model scale, not orthonormal
     R_real = R_real / (np.linalg.norm(R_real, axis=1, keepdims=True) + 1e-8)
-
-    front_calib = load_calib(front_calib_path, loadSize=1024)  # original calib was for 1024
-    if isinstance(front_calib, torch.Tensor):
-        front_calib = front_calib.numpy()
+    
     calibs = {"front": (front_calib.astype(np.float32), R_real)}
     print(f"  Real center: {real_center}")
 
     # Side/back: Blender cameras aligned to the same center
-    for v in ["left", "right", "back"]:
+    for v in valid_views:
+        if v == "front":
+            continue
         calibs[v] = build_blender_calib(v, real_center, extent)
     print(f"  Side cameras built with real center")
 
@@ -127,10 +228,16 @@ def main():
     head_bbox = head_mesh.get_axis_aligned_bounding_box()
     b_min = head_bbox.get_min_bound()
     b_max = head_bbox.get_max_bound()
-    hair_bbox = mesh.get_axis_aligned_bounding_box()
-    b_min = np.minimum(b_min, hair_bbox.get_min_bound())
-    b_max = np.maximum(b_max, hair_bbox.get_max_bound())
-    padding = 0.03
+    
+    if mesh is not None:
+        hair_bbox = mesh.get_axis_aligned_bounding_box()
+        b_min = np.minimum(b_min, hair_bbox.get_min_bound())
+        b_max = np.maximum(b_max, hair_bbox.get_max_bound())
+        padding = 0.03
+    else:
+        # 如果没有发型网格，提供一个更大的容差，假设头发最高可达 0.12 的偏移
+        padding = 0.10
+        
     b_min = b_min - padding
     b_max = b_max + padding
     print(f"  BBox: [{b_min}, {b_max}]")
@@ -150,7 +257,7 @@ def main():
 
     # Save fusion debug data (before dilation)
     np.savez_compressed(
-        os.path.join(os.path.dirname(args.out_ply), "fusion_debug.npz"),
+        os.path.join(out_dir, "fusion_debug.npz"),
         fused_orien=fused_orien,
         boundary_mask=boundary_mask,
         view_ownership=view_ownership,
@@ -195,7 +302,7 @@ def main():
     import cv2
     front_depth = depth_maps["front"]
     front_strand_bgr = cv2.imread(
-        os.path.join(args.strand_dir, "front.png")
+        os.path.join(strand_dir, "front.png")
     ).astype(np.float32) / 255.0 * 2.0 - 1.0
 
     hairstep = np.concatenate([
@@ -229,22 +336,11 @@ def main():
     strategy.filter(data, mesh_path=args.mesh_obj)
     strategy.set_query_mode("orien")
 
-    # PDE's occupancy only covers the front-visible surface.
-    # Expand to hair_volume with EDT from nearest PDE direction.
-    pde_nonzero = np.abs(strategy._orien_vol).sum(axis=0) > 1e-6
-    missing = hair_volume & ~pde_nonzero
-    if missing.sum() > 0:
-        from scipy.ndimage import distance_transform_edt
-        print(f"  Expanding to hair_volume: +{missing.sum()} voxels via EDT...")
-        _, idx = distance_transform_edt(~pde_nonzero, return_indices=True)
-        for c in range(3):
-            flat = strategy._orien_vol[c].ravel()
-            strategy._orien_vol[c][missing] = flat[idx[c].ravel()[missing.ravel()]]
-        print(f"  Done.")
-
-    # Save orientation volume for debugging
+    # PDE's occupancy covers the front-visible surface (and back boundary).
+    # We do NOT use EDT expansion here, matching run_pde_generation.py logic,
+    # which avoids destroying the smooth PDE vector field with nearest-neighbor jumps.    # Save orientation volume for debugging
     np.save(
-        os.path.join(os.path.dirname(args.out_ply), "debug_orien_vol.npy"),
+        os.path.join(out_dir, "debug_orien_vol.npy"),
         strategy._orien_vol,
     )
     print(f"  Orientation volume saved.")
@@ -405,9 +501,9 @@ def main():
     # ================================================================
     #  7. Save
     # ================================================================
-    print(f"\nStep 7: Clipping & saving to {args.out_ply}...")
-    save_strands_with_mesh(strands, args.mesh_obj, args.out_ply, 0.3, is_eval=False)
-    print(f"Done → {args.out_ply}")
+    print(f"\nStep 7: Clipping & saving to {out_ply}...")
+    save_strands_with_mesh(strands, args.mesh_obj, out_ply, 0.3, is_eval=False)
+    print(f"Done → {out_ply}")
 
 
 if __name__ == "__main__":

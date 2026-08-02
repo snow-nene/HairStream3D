@@ -20,7 +20,7 @@ def query_grid(vol_5d, points_3n, b_min_tensor, b_max_tensor):
 
 
 def project_points(pts_3d, calib_tensor):
-    # pts_3d: [3, N]
+    # pts_3d: [3, N]    
     # calib_tensor: [1, 4, 4]
     N = pts_3d.shape[1]
     pts_homo = torch.cat([pts_3d, torch.ones(1, N, device=pts_3d.device)], dim=0) # [4, N]
@@ -161,10 +161,12 @@ def main():
     
     # 1. Load data
     img_name = args.img_name
-    strand_path = f"results/real_imgs/strand_map/{img_name}.png"
-    depth_path  = f"results/real_imgs/depth_map/{img_name}.npy"
-    calib_path  = f"results/real_imgs/param/{img_name}.npy"
-    
+    # strand_path = f"results/multiview_data/{img_name}/maps/strand_map/gt.png"
+    # depth_path  = f"results/multiview_data/{img_name}/maps/depth_map/gt.npy"
+    # calib_path  = f"results/multiview_data/{img_name}/maps/param/front.npy"
+    strand_path = f"results/multiview_data/real_imgs/strand_map/{img_name}.png"
+    depth_path  = f"results/multiview_data/real_imgs/depth_map/{img_name}.npy"
+    calib_path  = f"results/multiview_data/real_imgs/param/{img_name}.npy"
     strand_img = cv2.imread(strand_path).astype(np.float32) / 255.0 * 2.0 - 1.0 # [-1, 1]
     strand_rgb = strand_img.transpose(2, 0, 1) # [3, H, W]
     

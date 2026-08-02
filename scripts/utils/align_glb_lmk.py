@@ -116,8 +116,10 @@ class OptGLBLandmark(nn.Module):
         self.lmk_gt = torch.from_numpy(lmk_gt).float().cuda().unsqueeze(0)  # (1,N,2)
 
         # 可优化参数 —— 完全对应 opt_lmk.py（必须是 Parameter，不是 buffer）
-        ext = float(np.linalg.norm(lmk_3d_np.max(0) - lmk_3d_np.min(0)))
-        init_scale = 363.1 / max(ext / 0.9, 1e-3)
+        # 头部模型的 face landmark extent 大约是 0.174，对应的正确 scale 是 363.1
+        # 所以这里的 init_scale 应该按比例缩放
+        ext = max(lmk_3d_np.max(0) - lmk_3d_np.min(0))
+        init_scale = 363.1 * (0.174 / max(ext, 1e-3))
         center_init = torch.Tensor(lmk_3d_np.mean(0)).view(3, 1)
 
         self.register_parameter('scale',    nn.Parameter(torch.Tensor([init_scale])))
@@ -247,8 +249,11 @@ def main():
     parser.add_argument("--glb_ply",   required=True, help="GLB 转出的 PLY")
     parser.add_argument("--strand_map",required=True, help="strand_map 图（头发区域）")
     parser.add_argument("--out_dir",   required=True)
+    parser.add_argument("--glb_to_world", default=None,
+                        help="可选: align_and_extract_hair.py 输出的 glb_to_world.npz。"
+                             "若提供，将把优化结果从 GLB 坐标系变换到 head_model 世界坐标系。")
     parser.add_argument("--lr",        type=float, default=0.01)
-    parser.add_argument("--epochs",    type=int,   default=201)
+    parser.add_argument('--epochs', type=int, default=1000, help="优化轮数")
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -300,7 +305,60 @@ def main():
     # 保存 param（与 opt_cam.py 完全一致格式）
     param_path = os.path.join(args.out_dir, "glb_param.npy")
     lmk_opt.save_param(param_path)
-    print(f"\n  param 保存: {param_path}")
+    print(f"\n  param 保存 (GLB 坐标系): {param_path}")
+
+    # 如果提供了 glb_to_world.npz，将 center 变换到 head_model 世界坐标系
+    glb_to_world_path = args.glb_to_world
+    if glb_to_world_path is None:
+        # 尝试自动在 pixal3d/ 目录下查找
+        candidate = os.path.join(os.path.dirname(args.render_img), "glb_to_world.npz")
+        if os.path.exists(candidate):
+            glb_to_world_path = candidate
+            print(f"  自动找到 glb_to_world.npz: {glb_to_world_path}")
+
+    if glb_to_world_path and os.path.exists(glb_to_world_path):
+        T = np.load(glb_to_world_path)
+        c_u   = float(T['umeyama_scale'][0])
+        R_u   = T['umeyama_R']          # [3,3]
+        t_u   = T['umeyama_t']          # [3]
+        icp_T = T['icp_T']              # [4,4]
+
+        # 读取优化的 GLB坐标系 center
+        glb_param = np.load(param_path, allow_pickle=True).item()
+        center_glb = glb_param['center'].flatten().astype(np.float64)  # [3]
+        R_glb      = glb_param['R'].astype(np.float64)                 # [3,3]
+
+        # Umeyama: world = c * R_u @ glb + t_u
+        center_world = c_u * (R_u @ center_glb) + t_u
+        # ICP 在世界坐标内微调
+        center_world_h = np.append(center_world, 1.0)                  # [4]
+        center_world = (icp_T @ center_world_h)[:3]                    # [3]
+
+        # 旋转矩阵同理变换（必须遵循坐标系反向映射）
+        # R_trans = icp_T[:3, :3] @ R_u
+        # R_world = R_glb @ R_trans.T
+        R_trans = icp_T[:3, :3] @ R_u
+        R_world = R_glb @ R_trans.T
+        
+        # 强制正交化（SVD），虽然理论上已经是正交的
+        U, _, Vt = np.linalg.svd(R_world)
+        R_world = (U @ Vt).astype(np.float32)
+
+        # scale 也需要随之缩小（因为 World 比 GLB 大了 c_u 倍）
+        new_scale = glb_param['scale'] / c_u
+
+        world_param = {
+            'ortho_ratio': glb_param['ortho_ratio'],
+            'scale':       new_scale,
+            'center':      center_world.reshape(3, 1).astype(np.float32),
+            'R':           R_world,
+        }
+        world_param_path = os.path.join(args.out_dir, "glb_param.npy")
+        np.save(world_param_path, world_param)
+        print(f"  已将 center 变换到世界坐标: {center_world.round(4)}")
+        print(f"  World param 保存: {world_param_path}")
+    else:
+        print(f"  [WARN] 未找到 glb_to_world.npz，保存的 param 将使用 GLB 坐标系（可能不准确）")
 
     # 保存对齐可视化（与 opt_cam.py 一致）
     vis = lmk_opt.get_img_lmk()
