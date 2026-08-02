@@ -30,10 +30,9 @@ This directory contains all the utility, training, inference, rendering, and tes
   - `extract_hair_mesh.py`, `extract_hair_mesh_3d.py`, `extract_hair_mesh_flame.py`: Scripts to extract actual hair meshes from data.
 
 - **`render/`**: Blender and rendering tools.
-  - `render_hair.py`, `render_hair_final.py`: Renders the final hair generation.
   - `render_blender.py`, `render_multiview_blender.py`: Wrappers around Blender rendering logic.
-  - `render_glb_front.py`, `render_reconstructed.py`: Specific rendering paths.
-  - `compute_multiview_maps.py`, `render_multiview_maps.py`: Handles computing and rendering multi-view maps.
+  - `render_glb_front.py`, `render_reconstructed.py`: Specific rendering paths and feature map extraction.
+  - `compute_multiview_maps.py`: Handles computing multi-view maps.
 
 - **`utils/`**: General utilities and geometry alignments.
   - `align_and_extract_hair.py`, `align_mesh_to_head.py`, `align_glb_lmk.py`: Scripts handling hair and mesh alignment.
