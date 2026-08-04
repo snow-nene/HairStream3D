@@ -339,9 +339,12 @@ def main():
         print(f"\n{'=' * 60}")
         print(f"{view.upper()} — full pipeline")
 
-        img_path = os.path.join(args.render_dir, f"{view}_hair.png")
+        img_path = os.path.join(args.render_dir, f"{view}.png")
         if not os.path.exists(img_path):
-            print(f"  [SKIP] {img_path} not found")
+            img_path = os.path.join(args.render_dir, f"{view}_hair.png")
+
+        if not os.path.exists(img_path):
+            print(f"  [SKIP] {view}.png / {view}_hair.png not found in {args.render_dir}")
             continue
 
         # 2a. SAM masks

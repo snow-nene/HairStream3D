@@ -231,48 +231,51 @@ def fuse_multiview_orientation(
     view_ownership = np.full((R, R, R), -1, dtype=np.int8)
     view_index = {"front": 0, "left": 1, "right": 2, "back": 3}
 
-    # ── Pass 1: Front view FIRST (exclusive) ─────────────────────
-    print("[MultiviewFusion] Pass 1/2: Front view (exclusive ground truth)...")
-    v = "front"
-    calib, R_pure = calibs[v]  # calib=4×4 projection, R_pure=3×3 rotation
-    P3 = calib[:3, :3]   # includes intrinsic scaling — for projection
-    t3 = calib[:3, 3:4]
+    # ── Pass 1: Front view FIRST (if available) ─────────────────────
+    if "front" in strand_maps and "front" in calibs:
+        print("[MultiviewFusion] Pass 1/2: Front view (exclusive ground truth)...")
+        v = "front"
+        calib, R_pure = calibs[v]  # calib=4×4 projection, R_pure=3×3 rotation
+        P3 = calib[:3, :3]   # includes intrinsic scaling — for projection
+        t3 = calib[:3, 3:4]
 
-    # Project all voxels to front camera (uses full projection for NDC)
-    pts_cam = (P3 @ vox_flat) + t3  # (3, R^3)
-    vox_depth = pts_cam[2]  # depth in camera space
+        # Project all voxels to front camera (uses full projection for NDC)
+        pts_cam = (P3 @ vox_flat) + t3  # (3, R^3)
+        vox_depth = pts_cam[2]  # depth in camera space
 
-    # UV in [-1, 1] NDC
-    u = pts_cam[0]
-    v_uv = pts_cam[1]
-    px_front = np.clip(((u + 1.0) * 0.5 * W).astype(np.int32), 0, W - 1)
-    py_front = np.clip(((v_uv + 1.0) * 0.5 * H).astype(np.int32), 0, H - 1)
+        # UV in [-1, 1] NDC
+        u = pts_cam[0]
+        v_uv = pts_cam[1]
+        px_front = np.clip(((u + 1.0) * 0.5 * W).astype(np.int32), 0, W - 1)
+        py_front = np.clip(((v_uv + 1.0) * 0.5 * H).astype(np.int32), 0, H - 1)
 
-    # Query front strand_map and depth_map
-    dx_f, dy_f, hair_f = decode_strand_2d(strand_maps["front"], px_front, py_front)
-    surf_depth_f = np.where(
-        (px_front >= 0) & (px_front < W) & (py_front >= 0) & (py_front < H),
-        depth_maps["front"][py_front, px_front],
-        -1.0,
-    )
+        # Query front strand_map and depth_map
+        dx_f, dy_f, hair_f = decode_strand_2d(strand_maps["front"], px_front, py_front)
+        surf_depth_f = np.where(
+            (px_front >= 0) & (px_front < W) & (py_front >= 0) & (py_front < H),
+            depth_maps["front"][py_front, px_front],
+            -1.0,
+        )
 
-    # Surface margin for depth comparison
-    margin = (b_max[2] - b_min[2]) / R * 2.0 + front_surface_margin
-    is_surface_f = hair_f & (np.abs(vox_depth - surf_depth_f) < margin)
+        # Surface margin for depth comparison
+        margin = (b_max[2] - b_min[2]) / R * 2.0 + front_surface_margin
+        is_surface_f = hair_f & (np.abs(vox_depth - surf_depth_f) < margin)
 
-    # Back-project front 2D direction → 3D
-    dz_dx_f, dz_dy_f = compute_depth_gradient(depth_maps["front"], px_front, py_front)
-    dir_3d_f = backproject_direction(dx_f, dy_f, R_pure, dz_dx_f, dz_dy_f)
+        # Back-project front 2D direction → 3D
+        dz_dx_f, dz_dy_f = compute_depth_gradient(depth_maps["front"], px_front, py_front)
+        dir_3d_f = backproject_direction(dx_f, dy_f, R_pure, dz_dx_f, dz_dy_f)
 
-    # Assign front direction where front can see
-    idx_surf = np.where(is_surface_f)[0]
-    for c in range(3):
-        orien_vol.ravel()[c * R**3 + idx_surf] = dir_3d_f[idx_surf, c]
-    weight_vol.ravel()[idx_surf] = 1.0
-    view_ownership.ravel()[idx_surf] = view_index["front"]
+        # Assign front direction where front can see
+        idx_surf = np.where(is_surface_f)[0]
+        for c in range(3):
+            orien_vol.ravel()[c * R**3 + idx_surf] = dir_3d_f[idx_surf, c]
+        weight_vol.ravel()[idx_surf] = 1.0
+        view_ownership.ravel()[idx_surf] = view_index["front"]
 
-    n_front = len(idx_surf)
-    print(f"  Front covers {n_front}/{R**3} voxels ({100*n_front/R**3:.1f}%)")
+        n_front = len(idx_surf)
+        print(f"  Front covers {n_front}/{R**3} voxels ({100*n_front/R**3:.1f}%)")
+    else:
+        print("[MultiviewFusion] Pass 1/2: Front view NOT provided. Proceeding with available views...")
 
     # ── Pass 2: Other views (fill gaps only) ─────────────────────
     print("[MultiviewFusion] Pass 2/2: Left/Right/Back (fill unseen)...")

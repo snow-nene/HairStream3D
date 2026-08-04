@@ -9,9 +9,13 @@ parser.add_argument("--glb",    required=True)
 parser.add_argument("--out_dir",required=True)
 parser.add_argument("--size",   type=int, default=512)
 parser.add_argument("--views",  nargs="*", default=["front", "back", "left", "right", "top"])
+parser.add_argument("--camera_only", action="store_true",
+                    help="只导出相机矩阵，不重复渲染 PNG")
 args = parser.parse_args(argv)
 
 os.makedirs(args.out_dir, exist_ok=True)
+camera_dir = os.path.join(args.out_dir, "camera_params")
+os.makedirs(camera_dir, exist_ok=True)
 
 bpy.ops.wm.read_factory_settings(use_empty=True)
 
@@ -106,10 +110,49 @@ for view_name, offset in views.items():
         cam_obj.rotation_euler = (math.pi/2, 0, math.pi/2)
     elif view_name == 'top':
         cam_obj.rotation_euler = (0, 0, 0)
-    
+
+    # 强制更新依赖图后保存 Blender 渲染实际使用的矩阵。矩阵采用列向量约定：
+    # clip = world_to_clip @ world_homogeneous。
+    bpy.context.view_layer.update()
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    world_to_camera = cam_obj.matrix_world.inverted()
+    projection = cam_obj.calc_matrix_camera(
+        depsgraph,
+        x=args.size,
+        y=args.size,
+        scale_x=scene.render.pixel_aspect_x,
+        scale_y=scene.render.pixel_aspect_y,
+    )
+    world_to_clip = projection @ world_to_camera
+    verts_homogeneous = np.column_stack([verts_np, np.ones(len(verts_np))])
+    camera_vertices = verts_homogeneous @ np.asarray(world_to_camera, dtype=np.float64).T
+    camera_depth_min = camera_vertices[:, 2].min()
+    camera_depth_max = camera_vertices[:, 2].max()
+    np.savez(
+        os.path.join(camera_dir, f"{view_name}.npz"),
+        camera_to_world=np.asarray(cam_obj.matrix_world, dtype=np.float64),
+        world_to_camera=np.asarray(world_to_camera, dtype=np.float64),
+        projection=np.asarray(projection, dtype=np.float64),
+        world_to_clip=np.asarray(world_to_clip, dtype=np.float64),
+        camera_location=np.asarray(cam_obj.location, dtype=np.float64),
+        ortho_scale=np.float64(cam_data.ortho_scale),
+        image_size=np.asarray([args.size, args.size], dtype=np.int32),
+        mesh_center=center.astype(np.float64),
+        mesh_extent=np.float64(extent),
+        camera_depth_min=np.float64(camera_depth_min),
+        camera_depth_max=np.float64(camera_depth_max),
+    )
+    print(f"[Blender] Saved camera parameters for {view_name}")
+
+    if args.camera_only:
+        continue
+
     out_png = os.path.join(args.out_dir, f"{view_name}_rgb.png")
     scene.render.filepath = out_png
     bpy.ops.render.render(write_still=True)
     print(f"[Blender] Rendered {view_name}")
 
-print("[Blender] All views rendered successfully.")
+if args.camera_only:
+    print("[Blender] All camera parameters exported successfully.")
+else:
+    print("[Blender] All views rendered successfully.")

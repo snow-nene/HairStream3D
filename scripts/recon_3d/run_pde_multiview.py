@@ -32,6 +32,92 @@ from lib.multiview_fusion import (
 from lib.multiview_pde import MultiViewLaplacePDEStrategy
 
 
+def load_blender_view_calibration(data_dir, view):
+    """把 Blender 真值相机转换为 HairStep-world → image-NDC 标定。
+
+    Blender 渲染使用原始 GLB，而 PDE 体素位于 ``glb_to_world.npz`` 定义的
+    HairStep 世界坐标系。完整变换为：
+
+        HairStep world → raw glTF → Blender world → camera clip
+
+    返回的标定矩阵预先翻转 NDC y，使其兼容融合代码的左上图像原点；纯
+    旋转矩阵仍使用 Blender camera 的 y-up 坐标，供 2D strand 方向反投影。
+    """
+    camera_path = os.path.join(
+        data_dir, "blender_renders", "camera_params", f"{view}.npz"
+    )
+    transform_path = os.path.join(data_dir, "pixal3d", "glb_to_world.npz")
+    if not os.path.exists(camera_path):
+        raise FileNotFoundError(
+            f"缺少 {view} 真值相机: {camera_path}。请重新运行 render 阶段，"
+            "或用 render_multiview_blender.py --camera_only 补齐。"
+        )
+    if not os.path.exists(transform_path):
+        raise FileNotFoundError(
+            f"缺少 GLB→HairStep 变换: {transform_path}。请先运行 extract 阶段。"
+        )
+
+    camera = np.load(camera_path)
+    transform = np.load(transform_path)
+
+    umeyama = np.eye(4, dtype=np.float64)
+    umeyama[:3, :3] = (
+        float(np.asarray(transform["umeyama_scale"]).reshape(-1)[0])
+        * np.asarray(transform["umeyama_R"], dtype=np.float64)
+    )
+    umeyama[:3, 3] = np.asarray(transform["umeyama_t"], dtype=np.float64)
+    gltf_to_hairstep = np.asarray(transform["icp_T"], dtype=np.float64) @ umeyama
+
+    # glTF is Y-up; Blender imports it as Z-up: (x, y, z) → (x, -z, y).
+    gltf_to_blender = np.array(
+        [[1, 0, 0, 0], [0, 0, -1, 0], [0, 1, 0, 0], [0, 0, 0, 1]],
+        dtype=np.float64,
+    )
+    hairstep_to_blender = gltf_to_blender @ np.linalg.inv(gltf_to_hairstep)
+    world_to_clip = np.asarray(camera["world_to_clip"], dtype=np.float64)
+
+    # Existing fusion maps NDC y directly to image rows, so convert y-up to y-down.
+    ndc_to_image = np.diag([1.0, -1.0, 1.0, 1.0])
+    calib = ndc_to_image @ world_to_clip @ hairstep_to_blender
+
+    # Neural depth maps are normalized to [0, 1] per view, whereas Blender's
+    # OpenGL clip-z is near -1 for this orthographic scene. Normalize the exact
+    # camera-space depth over the rendered mesh range; larger camera-z is nearer.
+    if "camera_depth_min" not in camera or "camera_depth_max" not in camera:
+        raise KeyError(
+            f"{camera_path} 缺少 camera_depth_min/max，请用新版渲染脚本重新导出。"
+        )
+    hair_to_camera = (
+        np.asarray(camera["world_to_camera"], dtype=np.float64)
+        @ hairstep_to_blender
+    )
+    depth_min = float(camera["camera_depth_min"])
+    depth_max = float(camera["camera_depth_max"])
+    calib[2] = (
+        hair_to_camera[2] - depth_min * hair_to_camera[3]
+    ) / max(depth_max - depth_min, 1e-8)
+
+    # Direction back-projection needs rotation only (no Umeyama scale/translation).
+    gltf_to_hairstep_rotation = (
+        np.asarray(transform["icp_T"], dtype=np.float64)[:3, :3]
+        @ np.asarray(transform["umeyama_R"], dtype=np.float64)
+    )
+    camera_rotation = np.asarray(camera["world_to_camera"], dtype=np.float64)[:3, :3]
+    rotation = (
+        camera_rotation
+        @ gltf_to_blender[:3, :3]
+        @ gltf_to_hairstep_rotation.T
+    )
+    # Remove small numerical drift while retaining a proper SO(3) rotation.
+    u, _, vt = np.linalg.svd(rotation)
+    rotation = u @ vt
+    if np.linalg.det(rotation) < 0:
+        u[:, -1] *= -1
+        rotation = u @ vt
+
+    return calib.astype(np.float32), rotation.astype(np.float32)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Multi-View 3D Hair PDE Synthesis"
@@ -105,8 +191,8 @@ def main():
         print(f"  {v}: strand={strand_maps[v].shape}, depth={depth_maps[v].shape}")
         valid_views.append(v)
         
-    if "front" not in valid_views:
-        raise RuntimeError("Front view is required but missing.")
+    if len(valid_views) == 0:
+        raise RuntimeError("No valid views found for PDE reconstruction.")
 
     # ================================================================
     #  2. Build camera calibration matrices
@@ -135,10 +221,21 @@ def main():
         mesh = None
     print(f"  Mesh: {len(verts) if mesh else 0} verts, extent={extent:.4f}")
 
-    # Load REAL front calibration — MUST match the strand_map coordinate system
+    # ALWAYS use real front calibration (front.npy) for the front view — MUST match strand_map & depth_map
     from scripts.recon_3d.recon3D import load_calib
-    front_calib_path = os.path.join(data_dir, "maps", "param", "front.npy")
-    if not os.path.exists(front_calib_path):
+    real_calib_path = os.path.join(data_dir, "maps", "param", "front.npy")
+    glb_calib_path = os.path.join(data_dir, "maps", "param", "glb_param.npy")
+
+    if os.path.exists(real_calib_path):
+        front_calib_path = real_calib_path
+        print(f"  [Front Baseline] Using real front calibration: {front_calib_path}")
+    elif os.path.exists(glb_calib_path):
+        front_calib_path = glb_calib_path
+        print(f"  [Fallback] Using GLB front calibration: {front_calib_path}")
+    else:
+        front_calib_path = None
+
+    if front_calib_path is None or not os.path.exists(front_calib_path):
         print(f"  [WARN] Missing front camera calibration: {front_calib_path}")
         print(f"  [WARN] Falling back to dynamic front calibration.")
         
@@ -210,12 +307,12 @@ def main():
     calibs = {"front": (front_calib.astype(np.float32), R_real)}
     print(f"  Real center: {real_center}")
 
-    # Side/back: Blender cameras aligned to the same center
+    # Side/back: use the exact cameras that produced blender_renders/<view>.png.
     for v in valid_views:
         if v == "front":
             continue
-        calibs[v] = build_blender_calib(v, real_center, extent)
-    print(f"  Side cameras built with real center")
+        calibs[v] = load_blender_view_calibration(data_dir, v)
+        print(f"  {v}: loaded Blender ground-truth camera")
 
     # ================================================================
     #  3. Fuse multi-view strand directions → 3D orientation volume
@@ -267,7 +364,9 @@ def main():
     # Build hair volume: dilate boundary + add scalp region from head model.
     # This ensures roots on the scalp have orientation to grow from.
     from scipy.ndimage import binary_dilation
-    struct = np.ones((9, 9, 9), dtype=bool)
+    # Keep a narrow band around observed hair surfaces. The previous 9^3 × 4
+    # dilation expanded side-view errors through a ~32-voxel-thick region.
+    struct = np.ones((3, 3, 3), dtype=bool)
     hair_volume = binary_dilation(boundary_mask, structure=struct, iterations=4)
     hair_volume = hair_volume | boundary_mask
 
@@ -285,7 +384,9 @@ def main():
     scalp_sdf = head_scene.compute_signed_distance(
         o3d.core.Tensor(scalp_pts, dtype=o3d.core.Dtype.Float32)
     ).numpy().reshape(R_vol, R_vol, R_vol)
-    scalp_mask = scalp_sdf < 0.02  # inside or near head surface
+    # Only the scalp shell is a hair-growth domain; filling the entire negative
+    # SDF head interior lets camera directions propagate through the whole head.
+    scalp_mask = np.abs(scalp_sdf) < 0.02
     hair_volume = hair_volume | scalp_mask
     del gx, gy, gz, scalp_pts, scalp_sdf
     # head_scene kept alive for Step 4 scalp normal computation
@@ -318,7 +419,9 @@ def main():
     b_min_val = np.asarray(b_min, dtype=np.float32)
     b_max_val = np.asarray(b_max, dtype=np.float32)
 
-    # Run ORIGINAL single-view LaplacePDEStrategy (converges reliably)
+    # Keep the original strategy for a true front-only run. As soon as another
+    # view is present, consume the fused boundary built in Step 3 instead of
+    # silently rebuilding an orientation field from front data only.
     from lib.recon_strategy.laplace_pde import LaplacePDEStrategy
 
     opt_pde = argparse.Namespace()
@@ -332,7 +435,19 @@ def main():
     opt_pde.b_min = b_min_val
     opt_pde.b_max = b_max_val
 
-    strategy = LaplacePDEStrategy(opt_pde, cuda)
+    has_side_views = any(v != "front" for v in valid_views)
+    if has_side_views:
+        strategy = MultiViewLaplacePDEStrategy(opt_pde, cuda)
+        strategy.set_fused_data(
+            fused_orien,
+            boundary_mask,
+            hair_volume=hair_volume,
+            view_ownership=view_ownership,
+        )
+        print("  Using fused multi-view orientation boundary")
+    else:
+        strategy = LaplacePDEStrategy(opt_pde, cuda)
+        print("  Using original front-only orientation field")
     strategy.filter(data, mesh_path=args.mesh_obj)
     strategy.set_query_mode("orien")
 
