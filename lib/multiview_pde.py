@@ -31,17 +31,20 @@ class MultiViewLaplacePDEStrategy(LaplacePDEStrategy):
         super().__init__(opt, cuda)
         self._fused_orien_vol = None   # (3, R, R, R) from fusion
         self._fused_boundary = None    # (R, R, R) bool boundary mask
+        self._head_mesh_path = "data/head_model.obj"
         self._is_multiview = False
 
     def set_fused_data(self, orien_vol: np.ndarray, boundary_mask: np.ndarray,
                         hair_volume: np.ndarray = None,
-                        view_ownership: np.ndarray = None):
+                        view_ownership: np.ndarray = None,
+                        head_mesh_path: str = "data/head_model.obj"):
         R = self.resolution
         assert orien_vol.shape == (3, R, R, R)
         self._fused_orien_vol = orien_vol.copy()
         self._fused_boundary = boundary_mask.copy()
         self._fused_hair_volume = (hair_volume.copy() if hair_volume is not None else None)
         self._fused_view_owner = (view_ownership.copy() if view_ownership is not None else None)
+        self._head_mesh_path = head_mesh_path
         self._is_multiview = True
 
     def filter(self, data: dict, mesh_path: str = None) -> None:
@@ -154,7 +157,32 @@ class MultiViewLaplacePDEStrategy(LaplacePDEStrategy):
             for _ in range(min(3, self.dilation_iters // 2)):
                 is_hair = binary_dilation(is_hair, structure=struct)
 
-        print(f'  Dir BC: fused={is_all_boundary.sum()}, Hair domain={is_hair.sum()}')
+        scalp_boundary, scalp_normals = self._build_scalp_boundary(is_hair)
+        _, nearest_fused = distance_transform_edt(
+            ~is_all_boundary, return_indices=True
+        )
+        scalp_orien = np.zeros_like(fused_orien)
+        if scalp_boundary.any():
+            nearest_scalp = nearest_fused[:, scalp_boundary]
+            scalp_strands = fused_orien[
+                :, nearest_scalp[0], nearest_scalp[1], nearest_scalp[2]
+            ]
+            # Match the single-view inner boundary: strand direction remains
+            # dominant, while a smaller head-normal component restores volume.
+            blended = (
+                0.7 * scalp_strands
+                + 0.3 * scalp_normals[:, scalp_boundary]
+            )
+            blended /= np.linalg.norm(blended, axis=0, keepdims=True) + 1e-8
+            scalp_orien[:, scalp_boundary] = blended
+        all_boundary = is_all_boundary | scalp_boundary
+        boundary_orien = fused_orien.copy()
+        boundary_orien[:, scalp_boundary] = scalp_orien[:, scalp_boundary]
+
+        print(
+            f'  Dir BC: fused={is_all_boundary.sum()}, '
+            f'scalp={scalp_boundary.sum()}, Hair domain={is_hair.sum()}'
+        )
 
         # Initialize from the nearest contribution of any view. Directions are
         # already fused per voxel before entering this solver.
@@ -162,12 +190,12 @@ class MultiViewLaplacePDEStrategy(LaplacePDEStrategy):
         t0 = time.time()
         print('  Fused-boundary EDT...', end=' ', flush=True)
         _, nearest_idx = distance_transform_edt(
-            ~is_all_boundary, return_indices=True
+            ~all_boundary, return_indices=True
         )
         orien_vol = np.zeros_like(fused_orien)
         idx_hair = nearest_idx[:, is_hair]
         for c in range(3):
-            orien_vol[c][is_hair] = fused_orien[
+            orien_vol[c][is_hair] = boundary_orien[
                 c, idx_hair[0], idx_hair[1], idx_hair[2]
             ]
 
@@ -179,7 +207,7 @@ class MultiViewLaplacePDEStrategy(LaplacePDEStrategy):
             for c in range(3):
                 smoothed[c] = gaussian_filter(orien_vol[c], sigma=1.0)
             orien_vol[:, is_hair] = smoothed[:, is_hair]
-            orien_vol[:, is_all_boundary] = fused_orien[:, is_all_boundary]
+            orien_vol[:, all_boundary] = boundary_orien[:, all_boundary]
         print(f'{time.time()-t0:.1f}s')
 
         # ── Normalize ────────────────────────────────────────────
@@ -190,3 +218,51 @@ class MultiViewLaplacePDEStrategy(LaplacePDEStrategy):
         orien_vol[:, ~valid] = 0.0
 
         return orien_vol
+
+    def _build_scalp_boundary(self, is_hair: np.ndarray):
+        """Create the outward scalp boundary used by the single-view PDE."""
+        import open3d as o3d
+
+        scalp_mask = np.zeros_like(is_hair, dtype=bool)
+        scalp_orien = np.zeros((3,) + is_hair.shape, dtype=np.float32)
+        hair_indices = np.argwhere(is_hair)
+        if not len(hair_indices):
+            return scalp_mask, scalp_orien
+
+        head_mesh = o3d.io.read_triangle_mesh(str(self._head_mesh_path))
+        if not head_mesh.has_vertices() or not head_mesh.has_triangles():
+            raise ValueError(f"Head mesh is empty: {self._head_mesh_path}")
+        scene = o3d.t.geometry.RaycastingScene()
+        scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(head_mesh))
+
+        shape = np.asarray(is_hair.shape, dtype=np.float64)
+        b_min = np.asarray(self.b_min, dtype=np.float64)
+        b_max = np.asarray(self.b_max, dtype=np.float64)
+        points = b_min + hair_indices / np.maximum(shape - 1.0, 1.0) * (
+            b_max - b_min
+        )
+        query = o3d.core.Tensor(points.astype(np.float32))
+        signed_distance = scene.compute_signed_distance(query).numpy()
+        voxel_size = np.linalg.norm((b_max - b_min) / np.maximum(shape - 1.0, 1.0))
+        near_scalp = (
+            (signed_distance >= -voxel_size)
+            & (signed_distance <= 0.020)
+        )
+        if not near_scalp.any():
+            return scalp_mask, scalp_orien
+
+        scalp_indices = hair_indices[near_scalp]
+        scalp_points = points[near_scalp]
+        closest = scene.compute_closest_points(
+            o3d.core.Tensor(scalp_points.astype(np.float32))
+        )
+        normals = closest["primitive_normals"].numpy().astype(np.float32)
+        normals /= np.linalg.norm(normals, axis=1, keepdims=True) + 1e-8
+
+        head_center = np.asarray(head_mesh.get_center(), dtype=np.float32)
+        inward = np.sum(normals * (scalp_points - head_center), axis=1) < 0.0
+        normals[inward] *= -1.0
+        coordinates = tuple(scalp_indices.T)
+        scalp_mask[coordinates] = True
+        scalp_orien[:, coordinates[0], coordinates[1], coordinates[2]] = normals.T
+        return scalp_mask, scalp_orien

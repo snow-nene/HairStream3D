@@ -21,6 +21,12 @@ import torch
 from scipy.ndimage import gaussian_filter
 
 
+def align_vector_sign(vectors, reference):
+    """Flip 180-degree-ambiguous vectors into the reference hemisphere."""
+    flip = torch.sum(vectors * reference, dim=0, keepdim=True) < 0.0
+    return torch.where(flip, -vectors, vectors)
+
+
 def build_blender_calib(view, center, extent):
     """Build a 4×4 orthographic calibration matrix for a camera view.
     Matches the exact projection logic of load_calib in recon3D.py,
@@ -659,15 +665,17 @@ def build_multiview_seg_support_volume(
     resolution,
     slab_size=8,
     head_mesh_path="data/head_model.obj",
+    occluder_mesh_path=None,
     visibility_tolerance=None,
 ):
     """Fuse per-view segmentations with head-aware visibility.
 
     A view contributes positive evidence when a voxel is visible in front of
     the head and projects inside that view's hair segmentation. Visible
-    background is negative evidence, while voxels behind the head are ignored
-    for that view. The final support requires at least one positive view and no
-    visible negative view.
+    background is negative evidence, while voxels behind the head or the first
+    visible hair surface are ignored for that view. Front defines the
+    authoritative visible hairstyle envelope; where front is occluded or
+    unavailable, side/back votes provide support.
     """
     import open3d as o3d
 
@@ -678,15 +686,22 @@ def build_multiview_seg_support_volume(
         voxel_size = np.linalg.norm(
             (b_max - b_min) / max(resolution - 1, 1)
         )
-        visibility_tolerance = 1.5 * voxel_size
+        visibility_tolerance = max(1.5 * voxel_size, 0.03)
 
     head_mesh = o3d.io.read_triangle_mesh(str(head_mesh_path))
     if not head_mesh.has_vertices() or not head_mesh.has_triangles():
         raise ValueError(f"Head mesh is empty: {head_mesh_path}")
-    head_scene = o3d.t.geometry.RaycastingScene()
-    head_scene.add_triangles(
+    occlusion_scene = o3d.t.geometry.RaycastingScene()
+    occlusion_scene.add_triangles(
         o3d.t.geometry.TriangleMesh.from_legacy(head_mesh)
     )
+    if occluder_mesh_path is not None:
+        occluder_mesh = o3d.io.read_triangle_mesh(str(occluder_mesh_path))
+        if not occluder_mesh.has_vertices() or not occluder_mesh.has_triangles():
+            raise ValueError(f"Occluder mesh is empty: {occluder_mesh_path}")
+        occlusion_scene.add_triangles(
+            o3d.t.geometry.TriangleMesh.from_legacy(occluder_mesh)
+        )
 
     view_visibility = {}
     for view, mask in seg_masks.items():
@@ -718,13 +733,13 @@ def build_multiview_seg_support_volume(
             np.linalg.norm(ray_directions, axis=1, keepdims=True) + 1e-12
         )
         rays = np.column_stack([ray_origins, ray_directions]).astype(np.float32)
-        head_hits = head_scene.cast_rays(
+        occluder_hits = occlusion_scene.cast_rays(
             o3d.core.Tensor(rays)
         )["t_hit"].numpy()
         view_visibility[view] = (
             ray_origins.astype(np.float32).reshape(height, width, 3),
             ray_directions.astype(np.float32).reshape(height, width, 3),
-            head_hits.reshape(height, width),
+            occluder_hits.reshape(height, width),
         )
 
     xs = np.linspace(b_min[0], b_max[0], resolution, dtype=np.float32)
@@ -740,8 +755,10 @@ def build_multiview_seg_support_volume(
         points = np.column_stack([
             gx.ravel(), gy.ravel(), gz.ravel(), np.ones(gx.size, dtype=np.float32)
         ])
-        slab_positive = np.zeros(len(points), dtype=bool)
-        slab_negative = np.zeros(len(points), dtype=bool)
+        front_positive = np.zeros(len(points), dtype=bool)
+        front_negative = np.zeros(len(points), dtype=bool)
+        side_positive_votes = np.zeros(len(points), dtype=np.uint8)
+        side_negative_votes = np.zeros(len(points), dtype=np.uint8)
         for view, mask in seg_masks.items():
             if view not in calibs or view not in view_visibility:
                 continue
@@ -782,12 +799,27 @@ def build_multiview_seg_support_volume(
                 )
             )
             is_hair = np.asarray(mask[pixel_y, pixel_x], dtype=bool)
-            slab_positive[ids] |= visible & is_hair
-            slab_negative[ids] |= visible & ~is_hair
+            positive = visible & is_hair
+            negative = visible & ~is_hair
+            if view == "front":
+                front_positive[ids] |= positive
+                front_negative[ids] |= negative
+            else:
+                side_positive_votes[ids] += positive.astype(np.uint8)
+                side_negative_votes[ids] += negative.astype(np.uint8)
 
-        slab_support = slab_positive & ~slab_negative
-        positive_count += int(slab_positive.sum())
-        negative_count += int(slab_negative.sum())
+        # Front is the authoritative hairstyle envelope. Where the head hides
+        # a voxel from front, any visible side/back positive may recover it.
+        # Side-view negatives are not authoritative because synthesized masks
+        # and the aligned head/hair geometry differ by a few centimeters.
+        side_consensus = side_positive_votes > 0
+        slab_support = front_positive | (~front_negative & side_consensus)
+        positive_count += int(
+            (front_positive | (side_positive_votes > 0)).sum()
+        )
+        negative_count += int(
+            (front_negative | (side_negative_votes > 0)).sum()
+        )
         support[x_start:x_stop] = slab_support.reshape(
             x_stop - x_start, resolution, resolution
         )
@@ -797,6 +829,68 @@ def build_multiview_seg_support_volume(
         f"accepted={int(support.sum())}"
     )
     return support
+
+
+def build_mesh_metric_band(
+    mesh_path,
+    support_volume,
+    b_min,
+    b_max,
+    band_width=0.05,
+    slab_size=8,
+):
+    """Build a metric-width mesh band inside a precomputed support volume."""
+    import open3d as o3d
+
+    support_volume = np.asarray(support_volume, dtype=bool)
+    if support_volume.ndim != 3:
+        raise ValueError(
+            f"support_volume must be 3D, got {support_volume.shape}"
+        )
+    if band_width <= 0.0:
+        raise ValueError(f"band_width must be positive, got {band_width}")
+
+    mesh = o3d.io.read_triangle_mesh(str(mesh_path))
+    if not mesh.has_vertices() or not mesh.has_triangles():
+        raise ValueError(f"Metric-band mesh is empty: {mesh_path}")
+    scene = o3d.t.geometry.RaycastingScene()
+    scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(mesh))
+
+    b_min = np.asarray(b_min, dtype=np.float32)
+    b_max = np.asarray(b_max, dtype=np.float32)
+    shape = np.asarray(support_volume.shape, dtype=np.int32)
+    axes = [
+        np.linspace(b_min[axis], b_max[axis], shape[axis], dtype=np.float32)
+        for axis in range(3)
+    ]
+    band = np.zeros_like(support_volume, dtype=bool)
+    candidate_count = 0
+
+    for x_start in range(0, shape[0], int(slab_size)):
+        x_stop = min(x_start + int(slab_size), shape[0])
+        local_indices = np.argwhere(support_volume[x_start:x_stop])
+        if not len(local_indices):
+            continue
+        global_indices = local_indices.copy()
+        global_indices[:, 0] += x_start
+        points = np.column_stack([
+            axes[0][global_indices[:, 0]],
+            axes[1][global_indices[:, 1]],
+            axes[2][global_indices[:, 2]],
+        ]).astype(np.float32)
+        distances = scene.compute_distance(
+            o3d.core.Tensor(points)
+        ).numpy()
+        accepted = global_indices[distances < float(band_width)]
+        band[accepted[:, 0], accepted[:, 1], accepted[:, 2]] = True
+        candidate_count += len(global_indices)
+
+    print(
+        "[MultiviewFusion] Metric hair band: "
+        f"width={band_width:.3f}m, candidates={candidate_count}, "
+        f"accepted={int(band.sum())}"
+    )
+    return band
 
 
 def fuse_multiview_orientation(

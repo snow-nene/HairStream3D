@@ -26,7 +26,9 @@ import open3d as o3d
 import imageio.v2 as imageio
 
 from lib.multiview_fusion import (
+    align_vector_sign,
     build_mesh_root_guidance,
+    build_mesh_metric_band,
     build_blender_calib,
     build_multiview_seg_support_volume,
     build_visible_mesh_surface_shell,
@@ -106,19 +108,27 @@ def hair_synthesis_rk4(
     )
     current = root_tensor.squeeze(0)
     hair_strands[0] = current
+    previous_direction = None
 
     for index in range(1, num_sample):
         k1 = strategy.query(current.unsqueeze(0), calib_tensor).squeeze(0)
+        if previous_direction is not None:
+            k1 = align_vector_sign(k1, previous_direction)
         k2 = strategy.query(
             (current + 0.5 * hair_unit * k1).unsqueeze(0), calib_tensor
         ).squeeze(0)
+        k2 = align_vector_sign(k2, k1)
         k3 = strategy.query(
             (current + 0.5 * hair_unit * k2).unsqueeze(0), calib_tensor
         ).squeeze(0)
+        k3 = align_vector_sign(k3, k2)
         k4 = strategy.query(
             (current + hair_unit * k3).unsqueeze(0), calib_tensor
         ).squeeze(0)
+        k4 = align_vector_sign(k4, k3)
         direction = (k1 + 2 * k2 + 2 * k3 + k4) / 6.0
+        if previous_direction is not None:
+            direction = align_vector_sign(direction, previous_direction)
         progress = index / float(num_sample)
 
         if div_map_t is not None:
@@ -144,6 +154,7 @@ def hair_synthesis_rk4(
                 direction
                 + noise_weight.unsqueeze(0) * noise * magnitude
             )
+        previous_direction = direction
 
         current = current + hair_unit * direction
 
@@ -287,6 +298,18 @@ def main():
                         default="data/roots10k.obj")
     parser.add_argument("--pde_resolution", type=int, default=256)
     parser.add_argument("--pde_dilation_iters", type=int, default=6)
+    parser.add_argument(
+        "--pde_band_width",
+        type=float,
+        default=0.05,
+        help="Metric hair-mesh PDE band width in meters (default: 0.05)",
+    )
+    parser.add_argument(
+        "--head_occlusion_tolerance",
+        type=float,
+        default=0.03,
+        help="Head/hair alignment tolerance for visibility tests in meters",
+    )
     parser.add_argument("--pde_cg_tol", type=float, default=1e-4)
     parser.add_argument("--pde_cg_maxiter", type=int, default=2000)
     parser.add_argument("--pde_anisotropy", type=float, default=0.8)
@@ -668,11 +691,8 @@ def main():
     view_ownership.ravel()[unique_ids] = np.minimum.reduceat(
         contributing_views, starts
     )
-    hair_volume |= boundary_mask
-    # Match the single-view PDE's effective length control: the solve domain is
-    # a mesh-surface narrow band intersected with the observed 2D hair masks.
-    # Outside this domain the orientation remains zero, so RK4 naturally stops.
-    from scipy.ndimage import binary_dilation
+    # Match the single-view PDE's physical length control: use a metric band
+    # around the hair mesh rather than a resolution-dependent voxel dilation.
     seg_support_volume = build_multiview_seg_support_volume(
         calibs,
         seg_masks,
@@ -680,20 +700,23 @@ def main():
         b_max,
         args.pde_resolution,
         head_mesh_path="data/head_model.obj",
+        occluder_mesh_path=aligned_surface_path,
+        visibility_tolerance=args.head_occlusion_tolerance,
     )
     boundary_mask &= seg_support_volume
     fused_orien[:, ~boundary_mask] = 0.0
     view_ownership[~boundary_mask] = -1
-    hair_volume = binary_dilation(
-        hair_volume,
-        structure=np.ones((3, 3, 3), dtype=bool),
-        iterations=args.pde_dilation_iters,
+    hair_volume = build_mesh_metric_band(
+        aligned_surface_path,
+        seg_support_volume,
+        b_min,
+        b_max,
+        band_width=args.pde_band_width,
     )
-    hair_volume &= seg_support_volume
     hair_volume |= boundary_mask
     print(
         f"  Visible outer shell: raw={raw_surface_shell.sum()}, "
-        f"dilated={hair_volume.sum()}, per_view={shell_counts}; "
+        f"metric_band={hair_volume.sum()}, per_view={shell_counts}; "
         f"fused contribution voxels={boundary_mask.sum()}"
     )
 
@@ -761,6 +784,7 @@ def main():
             boundary_mask,
             hair_volume=hair_volume,
             view_ownership=view_ownership,
+            head_mesh_path="data/head_model.obj",
         )
         print("  Using fused multi-view orientation boundary")
     else:
