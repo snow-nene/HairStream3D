@@ -38,22 +38,63 @@ def read_ply_strands(ply_path):
         is_binary = "binary_little_endian" in header_text
         num_verts = 0
         num_edges = 0
-        is_double = "property double" in header_text
+        current_element = None
+        vertex_properties = []
+        edge_properties = []
 
         for line in header_text.split('\n'):
             line = line.strip()
             if line.startswith("element vertex"):
                 num_verts = int(line.split()[-1])
+                current_element = "vertex"
             elif line.startswith("element edge") or line.startswith("element line"):
                 num_edges = int(line.split()[-1])
+                current_element = "edge"
+            elif line.startswith("element "):
+                current_element = None
+            elif line.startswith("property ") and " list " not in f" {line} ":
+                _, property_type, property_name = line.split()[:3]
+                if current_element == "vertex":
+                    vertex_properties.append((property_name, property_type))
+                elif current_element == "edge":
+                    edge_properties.append((property_name, property_type))
 
         if is_binary:
-            dtype_vert = '<f8' if is_double else '<f4'
-            vert_bytes = f.read(num_verts * 3 * (8 if is_double else 4))
-            points = np.frombuffer(vert_bytes, dtype=dtype_vert).reshape(num_verts, 3).astype(np.float32)
+            ply_types = {
+                "char": "i1", "int8": "i1", "uchar": "u1", "uint8": "u1",
+                "short": "<i2", "int16": "<i2", "ushort": "<u2", "uint16": "<u2",
+                "int": "<i4", "int32": "<i4", "uint": "<u4", "uint32": "<u4",
+                "float": "<f4", "float32": "<f4", "double": "<f8", "float64": "<f8",
+            }
 
-            edge_bytes = f.read(num_edges * 2 * 4)
-            lines = np.frombuffer(edge_bytes, dtype='<i4').reshape(num_edges, 2)
+            def structured_dtype(properties):
+                try:
+                    return np.dtype([
+                        (name, ply_types[property_type])
+                        for name, property_type in properties
+                    ])
+                except KeyError as error:
+                    raise ValueError(f"Unsupported binary PLY property type: {error}")
+
+            vertex_data = np.fromfile(
+                f, dtype=structured_dtype(vertex_properties), count=num_verts
+            )
+            points = np.column_stack([
+                vertex_data["x"], vertex_data["y"], vertex_data["z"]
+            ]).astype(np.float32)
+
+            edge_data = np.fromfile(
+                f, dtype=structured_dtype(edge_properties), count=num_edges
+            )
+            edge_names = edge_data.dtype.names
+            if "vertex1" in edge_names and "vertex2" in edge_names:
+                lines = np.column_stack([
+                    edge_data["vertex1"], edge_data["vertex2"]
+                ]).astype(np.int64)
+            else:
+                raise ValueError(
+                    f"Binary PLY edge indices not found; properties={edge_names}"
+                )
         else:
             # ASCII 解析
             body_text = f.read().decode('ascii', errors='ignore')
@@ -191,4 +232,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

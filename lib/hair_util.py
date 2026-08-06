@@ -102,6 +102,32 @@ def save_strands_with_mesh(strands, mesh_path, outputpath, err=0.3, is_eval=Fals
     o3d.io.write_line_set(outputpath, line_set)
     print(f"[Strand Pruning] Filtered out short strands (< {min_len*100:.1f} cm). Kept {len(lst_pc_all_valid)} / {strands.shape[0]} strands.")
 
+
+def save_polyline_strands(curves, outputpath):
+    """Save variable-length 3D polyline curves as an Open3D LineSet."""
+    points = []
+    lines = []
+    for curve in curves:
+        curve = np.asarray(curve, dtype=np.float64)
+        if len(curve) < 2:
+            continue
+        offset = len(points)
+        points.extend(curve)
+        lines.extend(
+            [offset + index, offset + index + 1]
+            for index in range(len(curve) - 1)
+        )
+    line_set = o3d.geometry.LineSet(
+        points=o3d.utility.Vector3dVector(np.asarray(points, dtype=np.float64)),
+        lines=o3d.utility.Vector2iVector(np.asarray(lines, dtype=np.int32)),
+    )
+    if not o3d.io.write_line_set(str(outputpath), line_set):
+        raise RuntimeError(f"Failed to write polyline strands: {outputpath}")
+    print(
+        f"[Polyline Strands] Saved {len(curves)} curves "
+        f"({len(points)} points) to {outputpath}"
+    )
+
 def get_hair_root(filepath='./data/roots10k.obj'):
     from lib.mesh_util import load_obj_mesh
     root, _ = load_obj_mesh(filepath)

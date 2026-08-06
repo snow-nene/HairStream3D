@@ -90,7 +90,7 @@ def main():
                         help="Image ID used for multiview_data directory")
     parser.add_argument("--views", nargs="+", default=VIEWS,
                         help="Views to process")
-    parser.add_argument("--strength", type=float, default=0.8,
+    parser.add_argument("--strength", type=float, default=1.0,
                         help="Inpaint strength: 0=keep hair as-is, 1=full regenerate. "
                              "Higher = more texture detail but may alter hairstyle.")
     parser.add_argument("--steps", type=int, default=30,

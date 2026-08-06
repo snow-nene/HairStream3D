@@ -26,10 +26,159 @@ import open3d as o3d
 import imageio.v2 as imageio
 
 from lib.multiview_fusion import (
+    build_mesh_root_guidance,
     build_blender_calib,
+    build_multiview_seg_support_volume,
+    build_visible_mesh_surface_shell,
+    compute_root_head_visibility,
+    extract_view_mesh_surface_contribution,
     fuse_multiview_orientation,
+    save_mesh_root_projections,
+    trace_view_strands_3d,
 )
 from lib.multiview_pde import MultiViewLaplacePDEStrategy
+
+
+def query_grid(vol_5d, points_3n, b_min_tensor, b_max_tensor):
+    """Sample a 3D volume at world-space points."""
+    uv = (points_3n.unsqueeze(0) - b_min_tensor) / (
+        b_max_tensor - b_min_tensor
+    )
+    uv = uv * 2.0 - 1.0
+    grid = uv.permute(0, 2, 1)
+    grid = grid[..., [2, 1, 0]].unsqueeze(2).unsqueeze(2)
+    value = torch.nn.functional.grid_sample(
+        vol_5d,
+        grid,
+        padding_mode="border",
+        align_corners=True,
+    )
+    return value.squeeze(-1).squeeze(-1).squeeze(0)
+
+
+def project_points(points_3d, calib_tensor):
+    """Project 3D points to image NDC coordinates."""
+    num_points = points_3d.shape[1]
+    homogeneous = torch.cat(
+        [
+            points_3d,
+            torch.ones(1, num_points, device=points_3d.device),
+        ],
+        dim=0,
+    )
+    uv = torch.matmul(calib_tensor.squeeze(0), homogeneous)
+    return uv[:2, :] / (uv[3:4, :] + 1e-8)
+
+
+def query_2d_map(map_tensor, uv):
+    """Sample an image-space tensor at NDC coordinates."""
+    grid = uv.unsqueeze(0).unsqueeze(2).permute(0, 3, 2, 1)
+    value = torch.nn.functional.grid_sample(
+        map_tensor,
+        grid,
+        padding_mode="border",
+        align_corners=True,
+    )
+    return value.squeeze(-1).squeeze(0)
+
+
+def hair_synthesis_rk4(
+    strategy,
+    cuda,
+    root_tensor,
+    calib_tensor,
+    num_sample=100,
+    hair_unit=0.006,
+    sdf_vol=None,
+    normal_vol=None,
+    b_min_t=None,
+    b_max_t=None,
+    noise_vol=None,
+    guide_strands=None,
+    guide_indices=None,
+    div_map_t=None,
+    valid_cluster_mask=None,
+):
+    """Trace strands with RK4 integration and continuous collision response."""
+    num_strands = root_tensor.shape[2]
+    hair_strands = torch.zeros(
+        num_sample, 3, num_strands, device=cuda
+    )
+    current = root_tensor.squeeze(0)
+    hair_strands[0] = current
+
+    for index in range(1, num_sample):
+        k1 = strategy.query(current.unsqueeze(0), calib_tensor).squeeze(0)
+        k2 = strategy.query(
+            (current + 0.5 * hair_unit * k1).unsqueeze(0), calib_tensor
+        ).squeeze(0)
+        k3 = strategy.query(
+            (current + 0.5 * hair_unit * k2).unsqueeze(0), calib_tensor
+        ).squeeze(0)
+        k4 = strategy.query(
+            (current + hair_unit * k3).unsqueeze(0), calib_tensor
+        ).squeeze(0)
+        direction = (k1 + 2 * k2 + 2 * k3 + k4) / 6.0
+        progress = index / float(num_sample)
+
+        if div_map_t is not None:
+            uv = project_points(current, calib_tensor)
+            divergence = query_2d_map(div_map_t, uv).squeeze(0)
+        else:
+            divergence = torch.zeros(num_strands, device=cuda)
+
+        magnitude = torch.norm(direction, dim=0, keepdim=True)
+        if noise_vol is not None:
+            noise = query_grid(
+                noise_vol, current, b_min_t, b_max_t
+            )
+            is_divergent = (divergence > 0.1).float()
+            divergence_magnitude = torch.clamp(divergence, 0.0, 1.0)
+            noise_weight = (
+                0.5
+                * progress**2
+                * divergence_magnitude
+                * is_divergent
+            )
+            direction = (
+                direction
+                + noise_weight.unsqueeze(0) * noise * magnitude
+            )
+
+        current = current + hair_unit * direction
+
+        if guide_strands is not None and guide_indices is not None:
+            guide_points = guide_strands[index, :, guide_indices]
+            is_clumping = (divergence < -0.1).float()
+            clump_magnitude = torch.clamp(-divergence, 0.0, 1.0)
+            ramp = min(1.0, progress / 0.5)
+            clump_weight = torch.clamp(
+                0.005 * ramp
+                + 0.01 * clump_magnitude * is_clumping * ramp,
+                0.0,
+                0.02,
+            )
+            if valid_cluster_mask is not None:
+                clump_weight = clump_weight * valid_cluster_mask
+            magnitude_weight = torch.clamp(
+                magnitude / 0.9, 0.0, 1.0
+            ).squeeze(0)
+            clump_weight = clump_weight * magnitude_weight
+            current = torch.lerp(
+                current, guide_points, clump_weight.unsqueeze(0)
+            )
+
+        if sdf_vol is not None:
+            sdf = query_grid(sdf_vol, current, b_min_t, b_max_t)
+            normal = query_grid(normal_vol, current, b_min_t, b_max_t)
+            normal = torch.nn.functional.normalize(normal, dim=0)
+            penetration = 0.005 - sdf
+            collision_mask = (penetration > 0).float()
+            current = current + collision_mask * penetration * normal
+
+        hair_strands[index] = current
+
+    return hair_strands.permute(2, 0, 1).cpu().detach().numpy()
 
 
 def load_blender_view_calibration(data_dir, view):
@@ -151,6 +300,14 @@ def main():
                         help="Depth tolerance for other views")
     parser.add_argument("--num_sample", type=int, default=100)
     parser.add_argument("--hair_unit", type=float, default=0.006)
+    parser.add_argument(
+        "--export-per-view",
+        action="store_true",
+        help=(
+            "Trace each view's 2D strand map and back-project it with that view's "
+            "depth map under pde_reconstruction/per_view/<view>/"
+        ),
+    )
     args = parser.parse_args()
 
     cuda = torch.device("cuda:0")
@@ -314,6 +471,53 @@ def main():
         calibs[v] = load_blender_view_calibration(data_dir, v)
         print(f"  {v}: loaded Blender ground-truth camera")
 
+    mesh_root_guidance = None
+    if any(v != "front" for v in valid_views):
+        guidance_mesh_path = os.path.join(data_dir, "pixal3d", "hair_mesh_sdf.obj")
+        if not os.path.exists(guidance_mesh_path):
+            guidance_mesh_path = os.path.join(
+                data_dir, "pixal3d", "hair_mesh_aligned_best.obj"
+            )
+        if os.path.exists(guidance_mesh_path):
+            from lib.hair_util import get_hair_root
+
+            roots_world = get_hair_root(args.roots).T
+            mesh_root_guidance = build_mesh_root_guidance(
+                guidance_mesh_path,
+                roots_world,
+                calibs,
+                strand_maps,
+                head_mesh_path="data/head_model.obj",
+            )
+            guidance_output = {
+                "roots_world": roots_world.astype(np.float32),
+                "mesh_path": np.asarray(str(guidance_mesh_path)),
+            }
+            for view, visible in mesh_root_guidance["visible_roots"].items():
+                guidance_output[f"{view}_visible_roots"] = visible
+            np.savez_compressed(
+                os.path.join(out_dir, "root_view_guidance.npz"),
+                **guidance_output,
+            )
+            background_paths = {
+                view: os.path.join(data_dir, "blender_renders", f"{view}.png")
+                for view in valid_views
+            }
+            raw_path_file = os.path.join(data_dir, "raw_img_path.txt")
+            if os.path.exists(raw_path_file):
+                with open(raw_path_file, "r", encoding="utf-8") as file:
+                    background_paths["front"] = file.read().strip()
+            save_mesh_root_projections(
+                mesh_root_guidance,
+                calibs,
+                strand_maps,
+                background_paths,
+                os.path.join(out_dir, "mesh_root_projection"),
+            )
+            print(f"  Mesh/root guidance: {guidance_mesh_path}")
+        else:
+            print("  [WARN] Hair mesh missing; side views will use legacy depth lifting")
+
     # ================================================================
     #  3. Fuse multi-view strand directions → 3D orientation volume
     # ================================================================
@@ -350,46 +554,160 @@ def main():
         extent=extent,
         front_surface_margin=args.front_surface_margin,
         other_surface_margin=args.other_surface_margin,
+        mesh_root_guidance=mesh_root_guidance,
     )
 
-    # Save fusion debug data (before dilation)
+    # Build the PDE domain from first-visible, hair-segmented hits on the
+    # aligned Pixal3D mesh.  Do not use the bald-head SDF to trim this shell.
+    aligned_surface_path = os.path.join(
+        data_dir, "pixal3d", "hair_mesh_aligned_best.obj"
+    )
+    if not os.path.exists(aligned_surface_path):
+        aligned_surface_path = args.mesh_obj
+    if not aligned_surface_path or not os.path.exists(aligned_surface_path):
+        raise FileNotFoundError(
+            "Visible surface shell requires pixal3d/hair_mesh_aligned_best.obj "
+            "or --mesh_obj"
+        )
+    seg_masks = {}
+    for view in valid_views:
+        seg_path = os.path.join(data_dir, "maps", "seg", f"{view}.png")
+        if not os.path.exists(seg_path):
+            raise FileNotFoundError(f"Missing hair seg for surface shell: {seg_path}")
+        seg = imageio.imread(seg_path)
+        if seg.ndim == 3:
+            seg = seg[:, :, 0]
+        if seg.shape != depth_maps[view].shape:
+            seg = cv2.resize(
+                seg.astype(np.uint8),
+                (depth_maps[view].shape[1], depth_maps[view].shape[0]),
+                interpolation=cv2.INTER_NEAREST,
+            )
+        seg_masks[view] = seg > 127
+
+    hair_volume, raw_surface_shell, shell_counts = build_visible_mesh_surface_shell(
+        aligned_surface_path,
+        calibs,
+        seg_masks,
+        b_min,
+        b_max,
+        args.pde_resolution,
+        shell_iterations=2,
+    )
+    # Replace the legacy depth-surface boundary with the actual per-view mesh
+    # surface contributions. Fuse the signless directions through their
+    # second-moment tensor, then use its principal eigenvector per voxel.
+    contribution_records = {}
+    flat_ids_all = []
+    directions_all = []
+    view_ids_all = []
+    shape = np.asarray(hair_volume.shape, dtype=np.int64)
+    for view_id, view in enumerate(valid_views):
+        contribution_points, contribution_lines = (
+            extract_view_mesh_surface_contribution(
+                aligned_surface_path,
+                strand_maps[view],
+                seg_masks[view],
+                calibs[view],
+            )
+        )
+        contribution_records[view] = (
+            contribution_points,
+            contribution_lines,
+        )
+        count = len(contribution_lines)
+        starts = contribution_points[:count]
+        directions = contribution_points[count:] - starts
+        directions /= np.linalg.norm(directions, axis=1, keepdims=True) + 1e-12
+        grid = np.rint(
+            (starts - b_min) / np.maximum(b_max - b_min, 1e-12)
+            * (shape - 1)
+        ).astype(np.int64)
+        inside = np.all((grid >= 0) & (grid < shape), axis=1)
+        grid = grid[inside]
+        flat_ids_all.append(np.ravel_multi_index(grid.T, tuple(shape)))
+        directions_all.append(directions[inside])
+        view_ids_all.append(np.full(inside.sum(), view_id, dtype=np.int8))
+
+    flat_ids = np.concatenate(flat_ids_all)
+    directions = np.concatenate(directions_all)
+    contributing_views = np.concatenate(view_ids_all)
+    order = np.argsort(flat_ids)
+    flat_ids = flat_ids[order]
+    directions = directions[order]
+    contributing_views = contributing_views[order]
+    unique_ids, starts = np.unique(flat_ids, return_index=True)
+    tensor_terms = np.column_stack([
+        directions[:, 0] * directions[:, 0],
+        directions[:, 0] * directions[:, 1],
+        directions[:, 0] * directions[:, 2],
+        directions[:, 1] * directions[:, 1],
+        directions[:, 1] * directions[:, 2],
+        directions[:, 2] * directions[:, 2],
+    ])
+    moments = np.add.reduceat(tensor_terms, starts, axis=0)
+    tensors = np.empty((len(unique_ids), 3, 3), dtype=np.float32)
+    tensors[:, 0, 0] = moments[:, 0]
+    tensors[:, 0, 1] = tensors[:, 1, 0] = moments[:, 1]
+    tensors[:, 0, 2] = tensors[:, 2, 0] = moments[:, 2]
+    tensors[:, 1, 1] = moments[:, 3]
+    tensors[:, 1, 2] = tensors[:, 2, 1] = moments[:, 4]
+    tensors[:, 2, 2] = moments[:, 5]
+    _, eigenvectors = np.linalg.eigh(tensors)
+    fused_directions = eigenvectors[:, :, -1]
+    reference = directions[starts]
+    flip = np.sum(fused_directions * reference, axis=1) < 0.0
+    fused_directions[flip] *= -1.0
+
+    fused_orien = np.zeros_like(fused_orien)
+    boundary_mask = np.zeros_like(boundary_mask)
+    view_ownership = np.full_like(view_ownership, -1)
+    fused_flat = fused_orien.reshape(3, -1)
+    fused_flat[:, unique_ids] = fused_directions.T
+    boundary_mask.ravel()[unique_ids] = True
+    view_ownership.ravel()[unique_ids] = np.minimum.reduceat(
+        contributing_views, starts
+    )
+    hair_volume |= boundary_mask
+    # Match the single-view PDE's effective length control: the solve domain is
+    # a mesh-surface narrow band intersected with the observed 2D hair masks.
+    # Outside this domain the orientation remains zero, so RK4 naturally stops.
+    from scipy.ndimage import binary_dilation
+    seg_support_volume = build_multiview_seg_support_volume(
+        calibs,
+        seg_masks,
+        b_min,
+        b_max,
+        args.pde_resolution,
+        head_mesh_path="data/head_model.obj",
+    )
+    boundary_mask &= seg_support_volume
+    fused_orien[:, ~boundary_mask] = 0.0
+    view_ownership[~boundary_mask] = -1
+    hair_volume = binary_dilation(
+        hair_volume,
+        structure=np.ones((3, 3, 3), dtype=bool),
+        iterations=args.pde_dilation_iters,
+    )
+    hair_volume &= seg_support_volume
+    hair_volume |= boundary_mask
+    print(
+        f"  Visible outer shell: raw={raw_surface_shell.sum()}, "
+        f"dilated={hair_volume.sum()}, per_view={shell_counts}; "
+        f"fused contribution voxels={boundary_mask.sum()}"
+    )
+
+    # Save fusion and outer-shell debug data.
     np.savez_compressed(
         os.path.join(out_dir, "fusion_debug.npz"),
         fused_orien=fused_orien,
         boundary_mask=boundary_mask,
         view_ownership=view_ownership,
+        raw_surface_shell=raw_surface_shell,
+        seg_support_volume=seg_support_volume,
+        hair_volume=hair_volume,
     )
     print(f"  Fusion debug saved.")
-
-    # Build hair volume: dilate boundary + add scalp region from head model.
-    # This ensures roots on the scalp have orientation to grow from.
-    from scipy.ndimage import binary_dilation
-    # Keep a narrow band around observed hair surfaces. The previous 9^3 × 4
-    # dilation expanded side-view errors through a ~32-voxel-thick region.
-    struct = np.ones((3, 3, 3), dtype=bool)
-    hair_volume = binary_dilation(boundary_mask, structure=struct, iterations=4)
-    hair_volume = hair_volume | boundary_mask
-
-    # Add head model interior (scalp) to hair volume
-    head_mesh_occ = o3d.io.read_triangle_mesh("data/head_model.obj")
-    head_t = o3d.t.geometry.TriangleMesh.from_legacy(head_mesh_occ)
-    head_scene = o3d.t.geometry.RaycastingScene()
-    head_scene.add_triangles(head_t)
-    R_vol = hair_volume.shape[0]
-    xs_h = np.linspace(b_min[0], b_max[0], R_vol)
-    ys_h = np.linspace(b_min[1], b_max[1], R_vol)
-    zs_h = np.linspace(b_min[2], b_max[2], R_vol)
-    gx, gy, gz = np.meshgrid(xs_h, ys_h, zs_h, indexing='ij')
-    scalp_pts = np.stack([gx.ravel(), gy.ravel(), gz.ravel()], axis=-1).astype(np.float32)
-    scalp_sdf = head_scene.compute_signed_distance(
-        o3d.core.Tensor(scalp_pts, dtype=o3d.core.Dtype.Float32)
-    ).numpy().reshape(R_vol, R_vol, R_vol)
-    # Only the scalp shell is a hair-growth domain; filling the entire negative
-    # SDF head interior lets camera directions propagate through the whole head.
-    scalp_mask = np.abs(scalp_sdf) < 0.02
-    hair_volume = hair_volume | scalp_mask
-    del gx, gy, gz, scalp_pts, scalp_sdf
-    # head_scene kept alive for Step 4 scalp normal computation
 
     print(f"  Hair volume: {hair_volume.sum()} voxels "
           f"({100*hair_volume.sum()/hair_volume.size:.1f}%)")
@@ -451,9 +769,8 @@ def main():
     strategy.filter(data, mesh_path=args.mesh_obj)
     strategy.set_query_mode("orien")
 
-    # PDE's occupancy covers the front-visible surface (and back boundary).
-    # We do NOT use EDT expansion here, matching run_pde_generation.py logic,
-    # which avoids destroying the smooth PDE vector field with nearest-neighbor jumps.    # Save orientation volume for debugging
+    # Keep the solved orientation inside the narrow PDE domain. Expanding it
+    # with nearest-neighbor EDT would introduce discontinuities into the field.
     np.save(
         os.path.join(out_dir, "debug_orien_vol.npy"),
         strategy._orien_vol,
@@ -498,14 +815,11 @@ def main():
     #  6. Load roots + synthesize strands via RK4
     # ================================================================
     print("\nStep 6: Loading roots + synthesizing strands...")
-    from lib.hair_util import get_hair_root, save_strands_with_mesh
-    from scripts.recon_3d.run_pde_generation import (
-        hair_synthesis_rk4,
-        project_points,
-        query_2d_map,
-        query_grid,
+    from lib.hair_util import (
+        get_hair_root,
+        save_polyline_strands,
+        save_strands_with_mesh,
     )
-
     root_tensor = (
         torch.from_numpy(get_hair_root(args.roots))
         .float()
@@ -558,18 +872,42 @@ def main():
     pts_homo = torch.cat([roots_3d, torch.ones(1, N_roots, device=cuda)], dim=0)
     uv = torch.matmul(calib_tensor.squeeze(0), pts_homo)
     uv = uv[:2, :] / (uv[3:4, :] + 1e-8)
-    uv_px = ((uv + 1.0) * 0.5 * 511).long().clamp(0, 511)
+    uv_px_float = (uv + 1.0) * 0.5 * 511
+    root_inside = (
+        (uv_px_float[0] >= 0) & (uv_px_float[0] <= 511)
+        & (uv_px_float[1] >= 0) & (uv_px_float[1] <= 511)
+    )
+    uv_px = uv_px_float.long().clamp(0, 511)
+    front_visible_np = compute_root_head_visibility(
+        "data/head_model.obj",
+        roots_3d.T.detach().cpu().numpy(),
+        calibs["front"][0],
+    )
+    front_visible = torch.from_numpy(front_visible_np).to(cuda)
+    root_hair_mask = torch.zeros(N_roots, dtype=torch.bool, device=cuda)
+    valid_pixels = torch.where(root_inside)[0]
+    root_hair_mask[valid_pixels] = (
+        torch.from_numpy(mask).to(cuda)[
+            uv_px[1, valid_pixels], uv_px[0, valid_pixels]
+        ] > 0.5
+    )
+    selectable_roots = root_inside & front_visible & root_hair_mask
+    selectable_ids = torch.where(selectable_roots)[0]
+    if len(selectable_ids) == 0:
+        raise RuntimeError("No front-visible roots overlap the front hair mask")
 
-    uv_np = uv_px.float().cpu().numpy().T
+    uv_np = uv_px_float[:, selectable_ids].T.detach().cpu().numpy()
+    num_guides = min(1024, len(selectable_ids))
     kmeans = MiniBatchKMeans(
-        n_clusters=1024, random_state=42, n_init="auto", batch_size=2048
+        n_clusters=num_guides, random_state=42, n_init="auto", batch_size=2048
     ).fit(uv_np)
     centroids_list = kmeans.cluster_centers_.tolist()
 
     guide_idx_list = []
     for cx, cy in centroids_list:
-        dist_sq = (uv_px[0].float() - cx) ** 2 + (uv_px[1].float() - cy) ** 2
-        guide_idx_list.append(torch.argmin(dist_sq).item())
+        candidate_uv = uv_px_float[:, selectable_ids]
+        dist_sq = (candidate_uv[0] - cx) ** 2 + (candidate_uv[1] - cy) ** 2
+        guide_idx_list.append(selectable_ids[torch.argmin(dist_sq)].item())
 
     guide_idx_tensor = torch.tensor(guide_idx_list, device=cuda)
     guide_roots = root_tensor[:, :, guide_idx_tensor]
@@ -578,8 +916,8 @@ def main():
 
     # Nearest-centroid mapping for all roots
     dist_sq_all = (
-        (uv_px[0].unsqueeze(0) - centroids_t[:, 0].unsqueeze(1)) ** 2
-        + (uv_px[1].unsqueeze(0) - centroids_t[:, 1].unsqueeze(1)) ** 2
+        (uv_px_float[0].unsqueeze(0) - centroids_t[:, 0].unsqueeze(1)) ** 2
+        + (uv_px_float[1].unsqueeze(0) - centroids_t[:, 1].unsqueeze(1)) ** 2
     )
     guide_indices_t = torch.argmin(dist_sq_all, dim=0)
 
@@ -597,9 +935,7 @@ def main():
 
     # Trace all strands with guide clustering
     print(f"  Tracing {N_roots} full strands...")
-    valid_cluster_mask = (
-        torch.from_numpy(mask).to(cuda)[uv_px[1], uv_px[0]]
-    )
+    valid_cluster_mask = selectable_roots.float()
 
     strands = hair_synthesis_rk4(
         strategy, cuda, root_tensor, calib_tensor,
@@ -618,6 +954,60 @@ def main():
     # ================================================================
     print(f"\nStep 7: Clipping & saving to {out_ply}...")
     save_strands_with_mesh(strands, args.mesh_obj, out_ply, 0.3, is_eval=False)
+
+    if args.export_per_view:
+        print("\nStep 8: Exporting independent per-view strands...")
+        per_view_root = os.path.join(out_dir, "per_view")
+        fused_out_dir = os.path.join(per_view_root, "fused")
+        os.makedirs(fused_out_dir, exist_ok=True)
+        save_strands_with_mesh(
+            strands,
+            args.mesh_obj,
+            os.path.join(fused_out_dir, "hair.ply"),
+            0.3,
+            is_eval=False,
+        )
+        for view in valid_views:
+            curves = trace_view_strands_3d(
+                strand_maps[view], depth_maps[view], calibs[view][0]
+            )
+            view_out_dir = os.path.join(per_view_root, view)
+            os.makedirs(view_out_dir, exist_ok=True)
+            depth_out_path = os.path.join(
+                view_out_dir, "depth_backprojected_hair.ply"
+            )
+            save_polyline_strands(curves, depth_out_path)
+
+            contribution_points, contribution_lines = contribution_records[view]
+            contribution = o3d.geometry.LineSet(
+                points=o3d.utility.Vector3dVector(contribution_points),
+                lines=o3d.utility.Vector2iVector(contribution_lines),
+            )
+            color = {
+                "front": [1.0, 0.12, 0.08],
+                "left": [0.08, 0.30, 1.0],
+                "right": [0.08, 0.75, 0.25],
+                "back": [0.75, 0.15, 0.85],
+            }.get(view, [0.8, 0.8, 0.8])
+            contribution.colors = o3d.utility.Vector3dVector(
+                np.tile(color, (len(contribution_lines), 1))
+            )
+            view_out_path = os.path.join(view_out_dir, "hair.ply")
+            contribution_out_dir = os.path.join(out_dir, "view_contributions")
+            os.makedirs(contribution_out_dir, exist_ok=True)
+            contribution_out_path = os.path.join(
+                contribution_out_dir, f"{view}.ply"
+            )
+            if not o3d.io.write_line_set(view_out_path, contribution):
+                raise RuntimeError(f"Failed to save {view_out_path}")
+            if not o3d.io.write_line_set(contribution_out_path, contribution):
+                raise RuntimeError(f"Failed to save {contribution_out_path}")
+            print(
+                f"  {view}: {len(contribution_lines)} mesh-surface contribution "
+                f"vectors -> {view_out_path}; {len(curves)} depth curves -> "
+                f"{depth_out_path}"
+            )
+
     print(f"Done → {out_ply}")
 
 

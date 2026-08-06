@@ -315,7 +315,13 @@ if run_stage "pde"; then
     echo "=================================================="
     echo " [5/6] PDE: 3D 融合解算 (生成毛发)"
     echo "=================================================="
-    PDE_ARGS=("--img_id" "$IMG_ID" "--pde_resolution" "384" "--pde_dilation_iters" "25")
+    PDE_ARGS=(
+        "--img_id" "$IMG_ID"
+        "--pde_resolution" "384"
+        "--pde_dilation_iters" "25"
+        "--mesh_obj" "${DATA_DIR}/pixal3d/hair_mesh_aligned_best.obj"
+        "--export-per-view"
+    )
     
     # 如果包含侧视角，开启多视角扩展
     OTHER_VIEWS_COUNT=0

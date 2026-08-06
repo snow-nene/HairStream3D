@@ -108,6 +108,128 @@ def decode_strand_2d(strand_map, px, py):
     return dx, dy, mask
 
 
+def trace_view_strands_3d(
+    strand_map,
+    depth_map,
+    calib,
+    seed_spacing=4,
+    step_pixels=1.5,
+    max_steps=512,
+    min_curve_points=6,
+):
+    """Trace one view's observed 2D orientation field and lift it to 3D.
+
+    The strand map is an undirected line field, so each seed is traced in both
+    directions and each new sample is sign-aligned with the previous tangent.
+    Every returned point comes directly from this view's depth map; no fused or
+    front-baseline orientation is consulted.
+    """
+    strand_map = np.asarray(strand_map, dtype=np.float32)
+    depth_map = np.asarray(depth_map, dtype=np.float32)
+    height, width = depth_map.shape
+    if strand_map.shape[:2] != depth_map.shape:
+        raise ValueError(
+            f"strand/depth shape mismatch: {strand_map.shape[:2]} vs "
+            f"{depth_map.shape}"
+        )
+
+    hair_mask = (strand_map[:, :, 0] > 0.1) & (depth_map > 0.05)
+    direction = np.stack(
+        [1.0 - 2.0 * strand_map[:, :, 2],
+         2.0 * strand_map[:, :, 1] - 1.0],
+        axis=-1,
+    )
+    direction /= np.linalg.norm(direction, axis=-1, keepdims=True) + 1e-8
+    direction[~hair_mask] = 0.0
+
+    def sample(array, point):
+        x, y = point
+        if x < 0 or x > width - 1 or y < 0 or y > height - 1:
+            return None
+        x0, y0 = int(np.floor(x)), int(np.floor(y))
+        x1, y1 = min(x0 + 1, width - 1), min(y0 + 1, height - 1)
+        wx, wy = x - x0, y - y0
+        return (
+            array[y0, x0] * (1.0 - wx) * (1.0 - wy)
+            + array[y0, x1] * wx * (1.0 - wy)
+            + array[y1, x0] * (1.0 - wx) * wy
+            + array[y1, x1] * wx * wy
+        )
+
+    def valid(point):
+        x, y = np.rint(point).astype(np.int32)
+        return 0 <= x < width and 0 <= y < height and hair_mask[y, x]
+
+    def follow(seed, sign):
+        point = np.asarray(seed, dtype=np.float32)
+        tangent = sample(direction, point)
+        if tangent is None or np.linalg.norm(tangent) < 1e-4:
+            return [point]
+        tangent = tangent / (np.linalg.norm(tangent) + 1e-8) * sign
+        curve = [point.copy()]
+        for _ in range(max_steps):
+            midpoint = point + 0.5 * step_pixels * tangent
+            mid_tangent = sample(direction, midpoint)
+            if mid_tangent is None or np.linalg.norm(mid_tangent) < 1e-4:
+                break
+            mid_tangent /= np.linalg.norm(mid_tangent) + 1e-8
+            if np.dot(mid_tangent, tangent) < 0.0:
+                mid_tangent *= -1.0
+            next_point = point + step_pixels * mid_tangent
+            if not valid(next_point):
+                break
+            curve.append(next_point.copy())
+            point = next_point
+            tangent = mid_tangent
+        return curve
+
+    grid_y, grid_x = np.mgrid[0:height:seed_spacing, 0:width:seed_spacing]
+    grid_candidates = np.column_stack([grid_y.ravel(), grid_x.ravel()])
+    grid_candidates = grid_candidates[
+        hair_mask[grid_candidates[:, 0], grid_candidates[:, 1]]
+    ]
+    all_candidates = np.argwhere(hair_mask)
+    candidates = np.concatenate([grid_candidates, all_candidates], axis=0)
+
+    visited = np.zeros_like(hair_mask, dtype=bool)
+    mark_radius = max(1, seed_spacing // 2)
+    curves_2d = []
+    for y, x in candidates:
+        if visited[y, x]:
+            continue
+        seed = np.array([x, y], dtype=np.float32)
+        backward = follow(seed, -1.0)
+        forward = follow(seed, 1.0)
+        curve = np.asarray(backward[:0:-1] + forward, dtype=np.float32)
+        if len(curve) < min_curve_points:
+            visited[y, x] = True
+            continue
+        curves_2d.append(curve)
+        pixels = np.rint(curve).astype(np.int32)
+        for px, py in pixels:
+            x0, x1 = max(0, px - mark_radius), min(width, px + mark_radius + 1)
+            y0, y1 = max(0, py - mark_radius), min(height, py + mark_radius + 1)
+            visited[y0:y1, x0:x1] = True
+
+    inverse_calib = np.linalg.inv(np.asarray(calib, dtype=np.float64))
+    curves_3d = []
+    for curve in curves_2d:
+        depths = np.asarray([sample(depth_map, point) for point in curve])
+        clip_points = np.column_stack(
+            [
+                curve[:, 0] / max(width - 1, 1) * 2.0 - 1.0,
+                curve[:, 1] / max(height - 1, 1) * 2.0 - 1.0,
+                depths,
+                np.ones(len(curve), dtype=np.float64),
+            ]
+        )
+        world_h = clip_points @ inverse_calib.T
+        world = world_h[:, :3] / np.clip(world_h[:, 3:4], 1e-8, None)
+        curves_3d.append(world.astype(np.float32))
+
+    return curves_3d
+
+
 def backproject_direction(dx_2d, dy_2d, R_v, dz_dx, dz_dy):
     """Back-project a 2D strand direction into 3D world space.
 
@@ -150,6 +272,203 @@ def backproject_direction(dx_2d, dy_2d, R_v, dz_dx, dz_dy):
     return d_world
 
 
+def backproject_direction_on_mesh(dx_2d, dy_2d, normals_world, R_v):
+    """Lift 2D strand directions onto the tangent plane of a known mesh.
+
+    For an orthographic camera, ``dx*ex + dy*ey + lambda*ez`` must be
+    perpendicular to the camera-space surface normal. Near silhouettes the
+    equation is ill-conditioned, so those samples are rejected.
+    """
+    normals_cam = (R_v @ normals_world.T).T
+    denom = normals_cam[:, 2]
+    stable = np.abs(denom) >= 0.15
+    depth_component = np.zeros_like(dx_2d, dtype=np.float32)
+    depth_component[stable] = -(
+        normals_cam[stable, 0] * dx_2d[stable]
+        + normals_cam[stable, 1] * dy_2d[stable]
+    ) / denom[stable]
+
+    direction_cam = np.stack([dx_2d, dy_2d, depth_component], axis=1)
+    direction_world = (R_v.T @ direction_cam.T).T
+    norms = np.linalg.norm(direction_world, axis=1, keepdims=True) + 1e-8
+    return (direction_world / norms).astype(np.float32), stable
+
+
+def compute_root_head_visibility(
+    head_mesh_path, roots_world, calib, surface_tolerance=0.005
+):
+    """Return roots visible from an orthographic camera without head occlusion.
+
+    Rays start on a camera-facing plane and travel toward each root.  A root is
+    visible when the first head-mesh hit is at the root (within tolerance),
+    behind it, or absent.  Back-side roots therefore cannot borrow a front-side
+    hair-mask pixel merely because both project to the same image coordinate.
+    """
+    import open3d as o3d
+
+    roots = np.asarray(roots_world, dtype=np.float32).reshape(-1, 3)
+    if len(roots) == 0:
+        return np.zeros(0, dtype=bool)
+
+    mesh = o3d.io.read_triangle_mesh(str(head_mesh_path))
+    if not mesh.has_vertices() or not mesh.has_triangles():
+        raise ValueError(f"Head mesh is empty: {head_mesh_path}")
+
+    linear = np.asarray(calib, dtype=np.float32)[:3, :3]
+    try:
+        toward_camera = np.linalg.solve(
+            linear, np.array([0.0, 0.0, 1.0], dtype=np.float32)
+        )
+    except np.linalg.LinAlgError:
+        toward_camera = linear[2]
+    toward_camera /= np.linalg.norm(toward_camera) + 1e-8
+
+    bounds = mesh.get_axis_aligned_bounding_box()
+    ray_length = max(float(np.linalg.norm(bounds.get_extent())) * 3.0, 1.0)
+    origins = roots + toward_camera[None, :] * ray_length
+    directions = np.broadcast_to(-toward_camera, origins.shape).copy()
+    rays = np.concatenate([origins, directions], axis=1).astype(np.float32)
+
+    scene = o3d.t.geometry.RaycastingScene()
+    scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(mesh))
+    hit_distance = scene.cast_rays(o3d.core.Tensor(rays))["t_hit"].numpy()
+    return (~np.isfinite(hit_distance)) | (
+        hit_distance >= ray_length - float(surface_tolerance)
+    )
+
+
+def build_mesh_root_guidance(
+    mesh_path, roots_world, calibs, strand_maps, head_mesh_path=None
+):
+    """Build mesh→root labels and per-view root visibility gates."""
+    import open3d as o3d
+    from scipy.spatial import cKDTree
+
+    mesh = o3d.io.read_triangle_mesh(str(mesh_path))
+    if not mesh.has_vertices() or not mesh.has_triangles():
+        raise ValueError(f"Hair mesh is empty: {mesh_path}")
+    mesh.compute_vertex_normals()
+    vertices = np.asarray(mesh.vertices, dtype=np.float32)
+    normals = np.asarray(mesh.vertex_normals, dtype=np.float32)
+    roots = np.asarray(roots_world, dtype=np.float32).reshape(-1, 3)
+
+    root_tree = cKDTree(roots)
+    _, vertex_root_ids = root_tree.query(vertices, k=1, workers=-1)
+    vertex_tree = cKDTree(vertices)
+
+    root_homogeneous = np.column_stack([roots, np.ones(len(roots), dtype=np.float32)])
+    visible_roots = {}
+    for view, strand_map in strand_maps.items():
+        if view not in calibs:
+            continue
+        calib = calibs[view][0]
+        projected = root_homogeneous @ calib.T
+        ndc = projected[:, :2] / np.clip(projected[:, 3:4], 1e-8, None)
+        height, width = strand_map.shape[:2]
+        px = np.rint((ndc[:, 0] + 1.0) * 0.5 * (width - 1)).astype(np.int32)
+        py = np.rint((ndc[:, 1] + 1.0) * 0.5 * (height - 1)).astype(np.int32)
+        inside = (px >= 0) & (px < width) & (py >= 0) & (py < height)
+        visible = np.zeros(len(roots), dtype=bool)
+        indices = np.where(inside)[0]
+        visible[indices] = strand_map[py[indices], px[indices], 0] > 0.1
+        if head_mesh_path is not None:
+            visible &= compute_root_head_visibility(
+                head_mesh_path, roots, calib
+            )
+        visible_roots[view] = visible
+        print(f"[MeshRootGuidance] {view}: {visible.sum()}/{len(roots)} roots covered")
+
+    return {
+        "roots": roots,
+        "vertices": vertices,
+        "normals": normals,
+        "vertex_tree": vertex_tree,
+        "vertex_root_ids": np.asarray(vertex_root_ids, dtype=np.int32),
+        "visible_roots": visible_roots,
+    }
+
+
+def save_mesh_root_projections(
+    guidance, calibs, strand_maps, background_paths, output_dir
+):
+    """Save per-view visible mesh regions colored by their assigned roots."""
+    import os
+    import cv2
+
+    os.makedirs(output_dir, exist_ok=True)
+    vertices = guidance["vertices"]
+    roots = guidance["roots"]
+    vertex_root_ids = guidance["vertex_root_ids"]
+    vertices_h = np.column_stack(
+        [vertices, np.ones(len(vertices), dtype=np.float32)]
+    )
+    roots_h = np.column_stack([roots, np.ones(len(roots), dtype=np.float32)])
+
+    root_min = roots.min(axis=0)
+    root_span = np.maximum(roots.max(axis=0) - root_min, 1e-6)
+    root_rgb = np.clip((roots - root_min) / root_span * 255.0, 0, 255).astype(np.uint8)
+    root_bgr = root_rgb[:, ::-1]
+
+    for view, strand_map in strand_maps.items():
+        if view not in calibs or view not in guidance["visible_roots"]:
+            continue
+        height, width = strand_map.shape[:2]
+        background = cv2.imread(str(background_paths.get(view, "")), cv2.IMREAD_COLOR)
+        if background is None:
+            background = np.zeros((height, width, 3), dtype=np.uint8)
+        else:
+            background = cv2.resize(background, (width, height))
+
+        calib = calibs[view][0]
+        projected = vertices_h @ calib.T
+        ndc = projected[:, :2] / np.clip(projected[:, 3:4], 1e-8, None)
+        px = np.rint((ndc[:, 0] + 1.0) * 0.5 * (width - 1)).astype(np.int32)
+        py = np.rint((ndc[:, 1] + 1.0) * 0.5 * (height - 1)).astype(np.int32)
+        inside = (px >= 0) & (px < width) & (py >= 0) & (py < height)
+
+        # Orthographic normalized depth uses larger z for points nearer camera.
+        inside_ids = np.where(inside)[0]
+        flat = py[inside_ids] * width + px[inside_ids]
+        depth = projected[inside_ids, 2]
+        zbuffer = np.full(height * width, -np.inf, dtype=np.float32)
+        np.maximum.at(zbuffer, flat, depth)
+        visible = depth >= zbuffer[flat] - 0.003
+        visible_ids = inside_ids[visible]
+
+        layer = np.zeros_like(background)
+        mesh_mask = np.zeros((height, width), dtype=np.uint8)
+        colors = root_bgr[vertex_root_ids[visible_ids]]
+        layer[py[visible_ids], px[visible_ids]] = colors
+        mesh_mask[py[visible_ids], px[visible_ids]] = 255
+        mesh_mask = cv2.dilate(mesh_mask, np.ones((3, 3), np.uint8), iterations=1)
+        layer = cv2.dilate(layer, np.ones((3, 3), np.uint8), iterations=1)
+
+        overlay = background.copy()
+        colored = mesh_mask > 0
+        blended = cv2.addWeighted(background, 0.35, layer, 0.65, 0)
+        overlay[colored] = blended[colored]
+
+        root_projected = roots_h @ calib.T
+        root_ndc = root_projected[:, :2] / np.clip(
+            root_projected[:, 3:4], 1e-8, None
+        )
+        root_px = np.rint((root_ndc[:, 0] + 1.0) * 0.5 * (width - 1)).astype(np.int32)
+        root_py = np.rint((root_ndc[:, 1] + 1.0) * 0.5 * (height - 1)).astype(np.int32)
+        root_visible = guidance["visible_roots"][view]
+        root_inside = (
+            root_visible
+            & (root_px >= 0) & (root_px < width)
+            & (root_py >= 0) & (root_py < height)
+        )
+        overlay[root_py[root_inside], root_px[root_inside]] = (255, 255, 255)
+        cv2.putText(
+            overlay,
+            f"{view}: visible roots {root_inside.sum()}/{len(roots)}",
+            (12, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2,
+        )
+        cv2.imwrite(os.path.join(output_dir, f"{view}.png"), overlay)
+
+
 def compute_depth_gradient(depth_map, px, py):
     from scipy.ndimage import gaussian_filter
     H, W = depth_map.shape
@@ -169,6 +488,317 @@ def compute_depth_gradient(depth_map, px, py):
     return dz_dx * 256.0, dz_dy * 256.0
 
 
+def build_visible_mesh_surface_shell(
+    mesh_path,
+    calibs,
+    seg_masks,
+    b_min,
+    b_max,
+    resolution,
+    shell_iterations=2,
+):
+    """Voxelize first-visible mesh hits from each hair-segmented view.
+
+    This deliberately does not classify points with the bald-head SDF.  The
+    source images constrain only the visible outer surface, so each pixel
+    contributes the first ray hit on ``mesh_path`` and the per-view hair seg
+    decides whether that hit belongs to the observed hair surface.
+    """
+    import open3d as o3d
+    from scipy.ndimage import binary_dilation
+
+    mesh = o3d.io.read_triangle_mesh(str(mesh_path))
+    if not mesh.has_vertices() or not mesh.has_triangles():
+        raise ValueError(f"Surface-shell mesh is empty: {mesh_path}")
+    scene = o3d.t.geometry.RaycastingScene()
+    scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(mesh))
+
+    b_min = np.asarray(b_min, dtype=np.float64)
+    b_max = np.asarray(b_max, dtype=np.float64)
+    shape = np.full(3, int(resolution), dtype=np.int32)
+    shell = np.zeros(tuple(shape), dtype=bool)
+    per_view_counts = {}
+
+    for view, mask in seg_masks.items():
+        if view not in calibs:
+            continue
+        calib = np.asarray(calibs[view][0], dtype=np.float64)
+        height, width = mask.shape
+        py, px = np.nonzero(mask)
+        if not len(px):
+            per_view_counts[view] = 0
+            continue
+        uv = np.column_stack([
+            px / max(width - 1, 1) * 2.0 - 1.0,
+            py / max(height - 1, 1) * 2.0 - 1.0,
+        ])
+        inverse = np.linalg.inv(calib)
+
+        def unproject(depth):
+            clip = np.column_stack([
+                uv,
+                np.full(len(uv), depth, dtype=np.float64),
+                np.ones(len(uv), dtype=np.float64),
+            ])
+            world_h = clip @ inverse.T
+            return world_h[:, :3] / world_h[:, 3:4]
+
+        near = unproject(1.5)
+        far = unproject(-0.5)
+        direction = far - near
+        direction /= np.linalg.norm(direction, axis=1, keepdims=True) + 1e-12
+        rays = np.column_stack([near, direction]).astype(np.float32)
+        hit = scene.cast_rays(o3d.core.Tensor(rays))["t_hit"].numpy()
+        valid = np.isfinite(hit)
+        points = near[valid] + direction[valid] * hit[valid, None]
+        grid = np.rint(
+            (points - b_min) / np.maximum(b_max - b_min, 1e-12)
+            * (shape - 1)
+        ).astype(np.int32)
+        inside = np.all((grid >= 0) & (grid < shape), axis=1)
+        grid = grid[inside]
+        shell[grid[:, 0], grid[:, 1], grid[:, 2]] = True
+        per_view_counts[view] = int(len(grid))
+
+    raw_shell = shell.copy()
+    if shell_iterations > 0:
+        shell = binary_dilation(
+            shell,
+            structure=np.ones((3, 3, 3), dtype=bool),
+            iterations=int(shell_iterations),
+        )
+    return shell, raw_shell, per_view_counts
+
+
+def extract_view_mesh_surface_contribution(
+    mesh_path,
+    strand_map,
+    seg_mask,
+    calib,
+    pixel_stride=2,
+    vector_length=0.003,
+):
+    """Lift one view's strand directions onto its first-visible mesh surface.
+
+    The returned short line segments are visualization/debug boundary vectors,
+    not independently back-projected hair curves.  Position comes from the
+    first camera-ray hit, while direction comes solely from this view's strand
+    map and is projected onto the hit triangle's tangent plane.
+    """
+    import open3d as o3d
+
+    mesh = o3d.io.read_triangle_mesh(str(mesh_path))
+    if not mesh.has_vertices() or not mesh.has_triangles():
+        raise ValueError(f"Contribution mesh is empty: {mesh_path}")
+    scene = o3d.t.geometry.RaycastingScene()
+    scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(mesh))
+
+    strand_map = np.asarray(strand_map, dtype=np.float32)
+    seg_mask = np.asarray(seg_mask, dtype=bool)
+    height, width = seg_mask.shape
+    valid_pixels = seg_mask & (strand_map[:, :, 0] > 0.1)
+    py, px = np.nonzero(valid_pixels)
+    keep = (px % pixel_stride == 0) & (py % pixel_stride == 0)
+    px, py = px[keep], py[keep]
+    if not len(px):
+        return np.empty((0, 3), np.float32), np.empty((0, 2), np.int32)
+
+    matrix = np.asarray(calib[0] if isinstance(calib, tuple) else calib, dtype=np.float64)
+    inverse = np.linalg.inv(matrix)
+    uv = np.column_stack([
+        px / max(width - 1, 1) * 2.0 - 1.0,
+        py / max(height - 1, 1) * 2.0 - 1.0,
+    ])
+
+    def unproject(coords, depth):
+        clip = np.column_stack([coords, depth, np.ones(len(coords))])
+        world_h = clip @ inverse.T
+        return world_h[:, :3] / world_h[:, 3:4]
+
+    near = unproject(uv, np.full(len(uv), 1.5))
+    far = unproject(uv, np.full(len(uv), -0.5))
+    ray_direction = far - near
+    ray_direction /= np.linalg.norm(ray_direction, axis=1, keepdims=True) + 1e-12
+    result = scene.cast_rays(
+        o3d.core.Tensor(np.column_stack([near, ray_direction]).astype(np.float32))
+    )
+    hit = result["t_hit"].numpy()
+    ray_valid = np.isfinite(hit)
+    points = near[ray_valid] + ray_direction[ray_valid] * hit[ray_valid, None]
+    normals = result["primitive_normals"].numpy()[ray_valid].astype(np.float64)
+    normals /= np.linalg.norm(normals, axis=1, keepdims=True) + 1e-12
+
+    uv_hit = uv[ray_valid]
+    homogeneous = np.column_stack([points, np.ones(len(points))])
+    projected = homogeneous @ matrix.T
+    depth = projected[:, 2] / projected[:, 3]
+    epsilon = 2.0 / max(height, width)
+    tangent_u = unproject(uv_hit + np.array([epsilon, 0.0]), depth) - points
+    tangent_v = unproject(uv_hit + np.array([0.0, epsilon]), depth) - points
+    hit_px, hit_py = px[ray_valid], py[ray_valid]
+    dx = 1.0 - 2.0 * strand_map[hit_py, hit_px, 2]
+    dy = 2.0 * strand_map[hit_py, hit_px, 1] - 1.0
+    directions = dx[:, None] * tangent_u + dy[:, None] * tangent_v
+    directions -= np.sum(directions * normals, axis=1, keepdims=True) * normals
+    norm = np.linalg.norm(directions, axis=1)
+    stable = norm > 1e-8
+    points = points[stable].astype(np.float32)
+    directions = (directions[stable] / norm[stable, None]).astype(np.float32)
+    endpoints = points + float(vector_length) * directions
+    count = len(points)
+    line_points = np.vstack([points, endpoints])
+    lines = np.column_stack([np.arange(count), np.arange(count) + count]).astype(np.int32)
+    return line_points, lines
+
+
+def build_multiview_seg_support_volume(
+    calibs,
+    seg_masks,
+    b_min,
+    b_max,
+    resolution,
+    slab_size=8,
+    head_mesh_path="data/head_model.obj",
+    visibility_tolerance=None,
+):
+    """Fuse per-view segmentations with head-aware visibility.
+
+    A view contributes positive evidence when a voxel is visible in front of
+    the head and projects inside that view's hair segmentation. Visible
+    background is negative evidence, while voxels behind the head are ignored
+    for that view. The final support requires at least one positive view and no
+    visible negative view.
+    """
+    import open3d as o3d
+
+    resolution = int(resolution)
+    b_min = np.asarray(b_min, dtype=np.float32)
+    b_max = np.asarray(b_max, dtype=np.float32)
+    if visibility_tolerance is None:
+        voxel_size = np.linalg.norm(
+            (b_max - b_min) / max(resolution - 1, 1)
+        )
+        visibility_tolerance = 1.5 * voxel_size
+
+    head_mesh = o3d.io.read_triangle_mesh(str(head_mesh_path))
+    if not head_mesh.has_vertices() or not head_mesh.has_triangles():
+        raise ValueError(f"Head mesh is empty: {head_mesh_path}")
+    head_scene = o3d.t.geometry.RaycastingScene()
+    head_scene.add_triangles(
+        o3d.t.geometry.TriangleMesh.from_legacy(head_mesh)
+    )
+
+    view_visibility = {}
+    for view, mask in seg_masks.items():
+        if view not in calibs:
+            continue
+        calib = calibs[view][0] if isinstance(calibs[view], tuple) else calibs[view]
+        inverse = np.linalg.inv(np.asarray(calib, dtype=np.float64))
+        height, width = mask.shape
+        py, px = np.meshgrid(
+            np.arange(height), np.arange(width), indexing="ij"
+        )
+        uv = np.column_stack([
+            px.ravel() / max(width - 1, 1) * 2.0 - 1.0,
+            py.ravel() / max(height - 1, 1) * 2.0 - 1.0,
+        ])
+
+        def unproject(depth):
+            clip = np.column_stack([
+                uv,
+                np.full(len(uv), depth, dtype=np.float64),
+                np.ones(len(uv), dtype=np.float64),
+            ])
+            world_h = clip @ inverse.T
+            return world_h[:, :3] / world_h[:, 3:4]
+
+        ray_origins = unproject(1.5)
+        ray_directions = unproject(-0.5) - ray_origins
+        ray_directions /= (
+            np.linalg.norm(ray_directions, axis=1, keepdims=True) + 1e-12
+        )
+        rays = np.column_stack([ray_origins, ray_directions]).astype(np.float32)
+        head_hits = head_scene.cast_rays(
+            o3d.core.Tensor(rays)
+        )["t_hit"].numpy()
+        view_visibility[view] = (
+            ray_origins.astype(np.float32).reshape(height, width, 3),
+            ray_directions.astype(np.float32).reshape(height, width, 3),
+            head_hits.reshape(height, width),
+        )
+
+    xs = np.linspace(b_min[0], b_max[0], resolution, dtype=np.float32)
+    ys = np.linspace(b_min[1], b_max[1], resolution, dtype=np.float32)
+    zs = np.linspace(b_min[2], b_max[2], resolution, dtype=np.float32)
+    support = np.zeros((resolution, resolution, resolution), dtype=bool)
+    positive_count = 0
+    negative_count = 0
+
+    for x_start in range(0, resolution, slab_size):
+        x_stop = min(x_start + slab_size, resolution)
+        gx, gy, gz = np.meshgrid(xs[x_start:x_stop], ys, zs, indexing="ij")
+        points = np.column_stack([
+            gx.ravel(), gy.ravel(), gz.ravel(), np.ones(gx.size, dtype=np.float32)
+        ])
+        slab_positive = np.zeros(len(points), dtype=bool)
+        slab_negative = np.zeros(len(points), dtype=bool)
+        for view, mask in seg_masks.items():
+            if view not in calibs or view not in view_visibility:
+                continue
+            calib = calibs[view][0] if isinstance(calibs[view], tuple) else calibs[view]
+            projected = points @ np.asarray(calib, dtype=np.float32).T
+            denominator = projected[:, 3:4]
+            denominator = np.where(
+                np.abs(denominator) < 1e-8,
+                np.copysign(1e-8, denominator + 1e-12),
+                denominator,
+            )
+            uv = projected[:, :2] / denominator
+            height, width = mask.shape
+            px = np.rint((uv[:, 0] + 1.0) * 0.5 * (width - 1)).astype(np.int32)
+            py = np.rint((uv[:, 1] + 1.0) * 0.5 * (height - 1)).astype(np.int32)
+            inside = (px >= 0) & (px < width) & (py >= 0) & (py < height)
+            ids = np.flatnonzero(inside)
+            if not len(ids):
+                continue
+
+            origins, directions, head_hits = view_visibility[view]
+            pixel_y, pixel_x = py[ids], px[ids]
+            ray_origins = origins[pixel_y, pixel_x]
+            ray_directions = directions[pixel_y, pixel_x]
+            voxel_distance = np.sum(
+                (points[ids, :3] - ray_origins) * ray_directions,
+                axis=1,
+            )
+            head_distance = head_hits[pixel_y, pixel_x]
+            visible = (
+                (voxel_distance >= 0.0)
+                & (
+                    ~np.isfinite(head_distance)
+                    | (
+                        voxel_distance
+                        <= head_distance + float(visibility_tolerance)
+                    )
+                )
+            )
+            is_hair = np.asarray(mask[pixel_y, pixel_x], dtype=bool)
+            slab_positive[ids] |= visible & is_hair
+            slab_negative[ids] |= visible & ~is_hair
+
+        slab_support = slab_positive & ~slab_negative
+        positive_count += int(slab_positive.sum())
+        negative_count += int(slab_negative.sum())
+        support[x_start:x_stop] = slab_support.reshape(
+            x_stop - x_start, resolution, resolution
+        )
+    print(
+        "[MultiviewFusion] Visibility-aware seg support: "
+        f"positive={positive_count}, negative={negative_count}, "
+        f"accepted={int(support.sum())}"
+    )
+    return support
+
+
 def fuse_multiview_orientation(
     strand_maps,      # dict: view → (H, W, 3) float32 [0, 1]
     depth_maps,        # dict: view → (H, W) float32 [0, 1]
@@ -180,6 +810,7 @@ def fuse_multiview_orientation(
     extent=0.3,
     front_surface_margin=0.02,
     other_surface_margin=0.015,
+    mesh_root_guidance=None,
 ):
     """Fuse multi-view 2D strand directions into a 3D orientation volume.
 
@@ -312,11 +943,38 @@ def fuse_multiview_orientation(
             print(f"  {v}: 0 new voxels (all already covered)")
             continue
 
-        dz_dx_v, dz_dy_v = compute_depth_gradient(depth_maps[v], px, py)
-        dir_3d_v = backproject_direction(dx_v, dy_v, R_pure, dz_dx_v, dz_dy_v)
-
         w = view_weights[v]
-        idx_fill = np.where(fill_mask)[0]
+        idx_candidates = np.where(fill_mask)[0]
+
+        if mesh_root_guidance is not None and v in mesh_root_guidance["visible_roots"]:
+            voxel_size = np.linalg.norm((b_max - b_min) / max(R - 1, 1))
+            query_points = vox_flat[:, idx_candidates].T
+            distances, vertex_ids = mesh_root_guidance["vertex_tree"].query(
+                query_points, k=1, workers=-1
+            )
+            root_ids = mesh_root_guidance["vertex_root_ids"][vertex_ids]
+            root_visible = mesh_root_guidance["visible_roots"][v][root_ids]
+            near_mesh = distances <= max(2.5 * voxel_size, 0.004)
+            normals = mesh_root_guidance["normals"][vertex_ids]
+            candidate_dirs, tangent_stable = backproject_direction_on_mesh(
+                dx_v[idx_candidates], dy_v[idx_candidates], normals, R_pure
+            )
+            accepted = near_mesh & root_visible & tangent_stable
+            idx_fill = idx_candidates[accepted]
+            dir_3d_v = np.zeros((len(px), 3), dtype=np.float32)
+            dir_3d_v[idx_fill] = candidate_dirs[accepted]
+            print(
+                f"  {v} mesh/root gate: {len(idx_fill)}/{len(idx_candidates)} accepted "
+                f"(mesh={near_mesh.sum()}, roots={root_visible.sum()}, tangent={tangent_stable.sum()})"
+            )
+        else:
+            dz_dx_v, dz_dy_v = compute_depth_gradient(depth_maps[v], px, py)
+            dir_3d_v = backproject_direction(dx_v, dy_v, R_pure, dz_dx_v, dz_dy_v)
+            idx_fill = idx_candidates
+
+        if len(idx_fill) == 0:
+            print(f"  {v}: 0 voxels after mesh/root gating")
+            continue
 
         for c in range(3):
             orien_vol.ravel()[c * R**3 + idx_fill] += w * dir_3d_v[idx_fill, c]

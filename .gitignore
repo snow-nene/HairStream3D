@@ -136,6 +136,11 @@ external/
 results/
 datasets/
 test*/
+!tests/
+tests/*
+!tests/test_root_head_visibility.py
+!tests/test_multiview_seg_visibility.py
+!tests/test_view_strand_backprojection.py
 
 # AI agents and extensions
 .agent/

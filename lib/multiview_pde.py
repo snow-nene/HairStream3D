@@ -58,14 +58,17 @@ class MultiViewLaplacePDEStrategy(LaplacePDEStrategy):
             # Fallback to single-view parent behavior
             return super().filter(data, mesh_path=mesh_path)
 
-        # First build the proven-stable front-only Laplace/CG field. Multi-view
-        # evidence is a residual correction, never a replacement for this base.
-        print('[MultiViewPDE] Building stable front Laplace baseline...')
-        super().filter(data, mesh_path=mesh_path)
-        front_field = self._orien_vol.copy()
-
-        print('[MultiViewPDE] Applying confidence-weighted side-view residual...')
-        self._orien_vol = self._apply_side_residual(front_field)
+        print('[MultiViewPDE] Solving directly from fused mesh-surface boundary...')
+        self._orien_vol = self._solve_pde_on_fused_boundary(
+            self._fused_orien_vol,
+            self._fused_boundary,
+            mesh_path=mesh_path,
+        )
+        self._occ_vol = (
+            self._fused_hair_volume.astype(np.float32)
+            if self._fused_hair_volume is not None
+            else self._fused_boundary.astype(np.float32)
+        )
         print('[MultiViewPDE] Field build complete.')
 
     def _apply_side_residual(self, front_field: np.ndarray) -> np.ndarray:
@@ -140,14 +143,8 @@ class MultiViewLaplacePDEStrategy(LaplacePDEStrategy):
         from scipy.ndimage import distance_transform_edt, gaussian_filter
 
         is_all_boundary = boundary_mask
-        if self._fused_view_owner is None:
-            is_front = is_all_boundary
-            is_side = np.zeros_like(is_all_boundary)
-        else:
-            is_front = is_all_boundary & (self._fused_view_owner == 0)
-            is_side = is_all_boundary & (self._fused_view_owner > 0)
-        if not is_front.any():
-            raise RuntimeError("Multi-view orientation requires a non-empty front boundary")
+        if not is_all_boundary.any():
+            raise RuntimeError("Multi-view orientation requires a non-empty fused boundary")
 
         if self._fused_hair_volume is not None:
             is_hair = self._fused_hair_volume | is_all_boundary
@@ -157,15 +154,15 @@ class MultiViewLaplacePDEStrategy(LaplacePDEStrategy):
             for _ in range(min(3, self.dilation_iters // 2)):
                 is_hair = binary_dilation(is_hair, structure=struct)
 
-        print(f'  Dir BC: front={is_front.sum()}, side={is_side.sum()}, '
-              f'Hair domain={is_hair.sum()}')
+        print(f'  Dir BC: fused={is_all_boundary.sum()}, Hair domain={is_hair.sum()}')
 
-        # Front-only nearest-boundary extension is the stable reference field.
+        # Initialize from the nearest contribution of any view. Directions are
+        # already fused per voxel before entering this solver.
         import time
         t0 = time.time()
-        print('  Front reference EDT...', end=' ', flush=True)
+        print('  Fused-boundary EDT...', end=' ', flush=True)
         _, nearest_idx = distance_transform_edt(
-            ~is_front, return_indices=True
+            ~is_all_boundary, return_indices=True
         )
         orien_vol = np.zeros_like(fused_orien)
         idx_hair = nearest_idx[:, is_hair]
@@ -174,35 +171,15 @@ class MultiViewLaplacePDEStrategy(LaplacePDEStrategy):
                 c, idx_hair[0], idx_hair[1], idx_hair[2]
             ]
 
-        # 2D strand orientation is signless. Flip each side direction to the
-        # hemisphere of its front-derived reference before blending.
-        side_target = fused_orien[:, is_side].copy()
-        side_reference = orien_vol[:, is_side]
-        if side_target.shape[1] > 0:
-            dots = np.sum(side_target * side_reference, axis=0)
-            side_target[:, dots < 0.0] *= -1.0
-            side_confidence = 0.25
-            side_target = (
-                (1.0 - side_confidence) * side_reference
-                + side_confidence * side_target
-            )
-            side_norm = np.linalg.norm(side_target, axis=0, keepdims=True) + 1e-8
-            side_target /= side_norm
-            orien_vol[:, is_side] = side_target
-
-        # A few clamped relaxation steps spread side evidence locally without
-        # allowing it to replace the front reference across the whole volume.
+        # Harmonic relaxation spreads all views symmetrically while clamping
+        # every fused surface contribution as a Dirichlet boundary.
         print(f' {time.time()-t0:.1f}s, harmonic relax...', end=' ', flush=True)
-        for _ in range(4):
+        for _ in range(8):
             smoothed = np.empty_like(orien_vol)
             for c in range(3):
                 smoothed[c] = gaussian_filter(orien_vol[c], sigma=1.0)
             orien_vol[:, is_hair] = smoothed[:, is_hair]
-            orien_vol[:, is_front] = fused_orien[:, is_front]
-            if side_target.shape[1] > 0:
-                orien_vol[:, is_side] = (
-                    0.75 * orien_vol[:, is_side] + 0.25 * side_target
-                )
+            orien_vol[:, is_all_boundary] = fused_orien[:, is_all_boundary]
         print(f'{time.time()-t0:.1f}s')
 
         # ── Normalize ────────────────────────────────────────────
