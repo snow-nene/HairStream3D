@@ -17,6 +17,7 @@ from scipy.ndimage import gaussian_filter, binary_dilation, binary_erosion
 import taichi as ti
 
 from .recon_strategy.laplace_pde import LaplacePDEStrategy
+from .multiview_fusion import limit_direction_normal_component
 
 
 class MultiViewLaplacePDEStrategy(LaplacePDEStrategy):
@@ -32,6 +33,10 @@ class MultiViewLaplacePDEStrategy(LaplacePDEStrategy):
         self._fused_orien_vol = None   # (3, R, R, R) from fusion
         self._fused_boundary = None    # (R, R, R) bool boundary mask
         self._head_mesh_path = "data/head_model.obj"
+        self._fallback_orien_vol = None
+        self.max_normal_component = float(
+            getattr(opt, "pde_max_normal_component", 0.3)
+        )
         self._is_multiview = False
 
     def set_fused_data(self, orien_vol: np.ndarray, boundary_mask: np.ndarray,
@@ -217,7 +222,68 @@ class MultiViewLaplacePDEStrategy(LaplacePDEStrategy):
             orien_vol[c][valid] /= norms[0][valid]
         orien_vol[:, ~valid] = 0.0
 
+        if mesh_path and self.max_normal_component < 1.0:
+            self._limit_field_surface_normal(
+                orien_vol,
+                valid,
+                mesh_path,
+            )
+
+        if valid.any():
+            from scipy.ndimage import distance_transform_edt
+            _, nearest = distance_transform_edt(~valid, return_indices=True)
+            fallback = np.empty_like(orien_vol)
+            for c in range(3):
+                fallback[c] = orien_vol[c, nearest[0], nearest[1], nearest[2]]
+            self._fallback_orien_vol = fallback
+
         return orien_vol
+
+    def query_fallback(self, points: torch.Tensor, calib: torch.Tensor):
+        """Sample the nearest-valid direction field for small domain gaps."""
+        if self._fallback_orien_vol is None:
+            return self.query_orien(points, calib)
+        vol_tensor = torch.from_numpy(self._fallback_orien_vol).float()
+        return self._trilinear_query(vol_tensor, points, out_channels=3)
+
+    def _limit_field_surface_normal(self, orien_vol, valid, mesh_path):
+        """Keep the solved field mostly tangent to the reconstructed hair mesh."""
+        import open3d as o3d
+
+        mesh = o3d.io.read_triangle_mesh(str(mesh_path))
+        if not mesh.has_vertices() or not mesh.has_triangles():
+            raise ValueError(f"Hair mesh is empty: {mesh_path}")
+        scene = o3d.t.geometry.RaycastingScene()
+        scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(mesh))
+
+        indices = np.argwhere(valid)
+        shape = np.asarray(valid.shape, dtype=np.float64)
+        b_min = np.asarray(self.b_min, dtype=np.float64)
+        b_max = np.asarray(self.b_max, dtype=np.float64)
+        changed = 0
+        for start in range(0, len(indices), 250_000):
+            chunk_indices = indices[start:start + 250_000]
+            points = b_min + chunk_indices / np.maximum(shape - 1.0, 1.0) * (
+                b_max - b_min
+            )
+            closest = scene.compute_closest_points(
+                o3d.core.Tensor(points.astype(np.float32))
+            )
+            normals = closest["primitive_normals"].numpy().astype(np.float32)
+            normals /= np.linalg.norm(normals, axis=1, keepdims=True) + 1e-8
+            coordinates = tuple(chunk_indices.T)
+            directions = orien_vol[:, coordinates[0], coordinates[1], coordinates[2]].T
+            limited, was_changed = limit_direction_normal_component(
+                directions,
+                normals,
+                self.max_normal_component,
+            )
+            orien_vol[:, coordinates[0], coordinates[1], coordinates[2]] = limited.T
+            changed += int(was_changed.sum())
+        print(
+            f'  Tangent field clamp: changed={changed}/{len(indices)}, '
+            f'|normal|<={self.max_normal_component:.2f}'
+        )
 
     def _build_scalp_boundary(self, is_hair: np.ndarray):
         """Create the outward scalp boundary used by the single-view PDE."""

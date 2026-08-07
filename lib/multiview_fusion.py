@@ -27,6 +27,142 @@ def align_vector_sign(vectors, reference):
     return torch.where(flip, -vectors, vectors)
 
 
+def limit_direction_normal_component(directions, normals, max_component=0.3):
+    """Clamp excessive surface-normal motion while preserving strand tangent."""
+    directions = np.asarray(directions, dtype=np.float32)
+    normals = np.asarray(normals, dtype=np.float32)
+    result = directions.copy()
+    normal_component = np.sum(directions * normals, axis=1)
+    tangent = directions - normal_component[:, None] * normals
+    tangent_norm = np.linalg.norm(tangent, axis=1)
+    needs_clamp = (
+        (np.abs(normal_component) > float(max_component))
+        & (tangent_norm > 1e-6)
+    )
+    if needs_clamp.any():
+        target_normal = np.clip(
+            normal_component[needs_clamp],
+            -float(max_component),
+            float(max_component),
+        )
+        tangent_unit = tangent[needs_clamp] / tangent_norm[needs_clamp, None]
+        tangent_weight = np.sqrt(np.maximum(1.0 - target_normal**2, 0.0))
+        result[needs_clamp] = (
+            tangent_weight[:, None] * tangent_unit
+            + target_normal[:, None] * normals[needs_clamp]
+        )
+    return result, needs_clamp
+
+
+def orient_sparse_direction_axes(
+    flat_ids,
+    axes,
+    reference_directions,
+    ownership,
+    volume_shape,
+    neighbor_radius=3.5,
+    preferred_owners=None,
+    preferred_direction=(0.0, -1.0, 0.0),
+    preferred_min_alignment=0.15,
+):
+    """Give sparse signless direction axes a spatially consistent sign.
+
+    Eigenvectors of ``v v^T`` have an arbitrary sign.  Propagating signs over
+    nearby samples preserves the smooth image-space strand axis, while the
+    original lifted directions choose one global sign per connected component.
+    Ownership prevents propagation across unrelated camera-view boundaries.
+    Selected side-view owners may use gravity to resolve the component-wide
+    sign; nearly horizontal components retain their lifted-view reference.
+    """
+    from collections import deque
+    from scipy.spatial import cKDTree
+
+    flat_ids = np.asarray(flat_ids, dtype=np.int64)
+    result = np.asarray(axes, dtype=np.float32).copy()
+    references = np.asarray(reference_directions, dtype=np.float32)
+    ownership = np.asarray(ownership)
+    preferred_owners = set(
+        np.asarray(preferred_owners if preferred_owners is not None else []).tolist()
+    )
+    preferred_direction = np.asarray(preferred_direction, dtype=np.float32)
+    preferred_direction /= np.linalg.norm(preferred_direction) + 1e-8
+    if len(flat_ids) == 0:
+        return result
+
+    coordinates = np.column_stack(
+        np.unravel_index(flat_ids, tuple(volume_shape))
+    ).astype(np.float32)
+    for owner in np.unique(ownership):
+        owner_ids = np.flatnonzero(ownership == owner)
+        if len(owner_ids) == 0:
+            continue
+        owner_coords = coordinates[owner_ids]
+        tree = cKDTree(owner_coords)
+        neighbors = tree.query_ball_point(owner_coords, r=float(neighbor_radius))
+        visited = np.zeros(len(owner_ids), dtype=bool)
+
+        for seed in range(len(owner_ids)):
+            if visited[seed]:
+                continue
+            visited[seed] = True
+            component = [seed]
+            queue = deque([seed])
+            while queue:
+                current = queue.popleft()
+                current_axis = result[owner_ids[current]]
+                for neighbor in neighbors[current]:
+                    if neighbor == current or visited[neighbor]:
+                        continue
+                    neighbor_id = owner_ids[neighbor]
+                    if np.dot(result[neighbor_id], current_axis) < 0.0:
+                        result[neighbor_id] *= -1.0
+                    visited[neighbor] = True
+                    component.append(neighbor)
+                    queue.append(neighbor)
+
+            # The traversal tree fixes parent-child signs.  A few conflicting
+            # edges can remain around loops, so optimize the local agreement
+            # objective with deterministic coordinate-descent sweeps.
+            for _ in range(8):
+                changed = False
+                for current in component:
+                    adjacent = [
+                        neighbor for neighbor in neighbors[current]
+                        if neighbor != current and visited[neighbor]
+                    ]
+                    if not adjacent:
+                        continue
+                    neighbor_ids = owner_ids[np.asarray(adjacent, dtype=np.int64)]
+                    neighbor_sum = result[neighbor_ids].sum(axis=0)
+                    current_id = owner_ids[current]
+                    if np.dot(result[current_id], neighbor_sum) < 0.0:
+                        result[current_id] *= -1.0
+                        changed = True
+                if not changed:
+                    break
+
+            component_ids = owner_ids[np.asarray(component, dtype=np.int64)]
+            use_preferred = False
+            if owner in preferred_owners:
+                preferred_alignment = (
+                    result[component_ids] @ preferred_direction
+                )
+                use_preferred = (
+                    np.mean(np.abs(preferred_alignment))
+                    >= float(preferred_min_alignment)
+                )
+            if use_preferred:
+                anchor_score = np.sum(preferred_alignment)
+            else:
+                anchor_score = np.sum(
+                    result[component_ids] * references[component_ids]
+                )
+            if anchor_score < 0.0:
+                result[component_ids] *= -1.0
+
+    return result
+
+
 def build_blender_calib(view, center, extent):
     """Build a 4×4 orthographic calibration matrix for a camera view.
     Matches the exact projection logic of load_calib in recon3D.py,
@@ -863,7 +999,7 @@ def build_mesh_metric_band(
         np.linspace(b_min[axis], b_max[axis], shape[axis], dtype=np.float32)
         for axis in range(3)
     ]
-    band = np.zeros_like(support_volume, dtype=bool)
+    band = np.zeros(tuple(shape), dtype=bool)
     candidate_count = 0
 
     for x_start in range(0, shape[0], int(slab_size)):

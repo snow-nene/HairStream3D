@@ -9,6 +9,8 @@ from lib.multiview_fusion import (
     align_vector_sign,
     build_mesh_metric_band,
     build_multiview_seg_support_volume,
+    limit_direction_normal_component,
+    orient_sparse_direction_axes,
 )
 
 
@@ -121,6 +123,87 @@ class MultiviewSegVisibilityTest(unittest.TestCase):
         aligned = align_vector_sign(vectors, reference)
 
         self.assertTrue(torch.all(torch.sum(aligned * reference, dim=0) >= 0.0))
+
+    def test_sparse_direction_axes_propagate_consistent_sign(self):
+        shape = (12, 12, 12)
+        coordinates = np.array(
+            [[5, 5, 2], [5, 5, 4], [5, 5, 6], [5, 5, 8]]
+        )
+        flat_ids = np.ravel_multi_index(coordinates.T, shape)
+        axes = np.array(
+            [[0, -1, 0], [0, 1, 0], [0, -1, 0], [0, 1, 0]],
+            dtype=np.float32,
+        )
+        references = np.array(
+            [[0, -1, 0], [0, -1, 0], [0, 1, 0], [0, -1, 0]],
+            dtype=np.float32,
+        )
+
+        oriented = orient_sparse_direction_axes(
+            flat_ids,
+            axes,
+            references,
+            np.ones(4, dtype=np.int8),
+            shape,
+        )
+
+        self.assertTrue(np.all(oriented[:, 1] < 0.0))
+        self.assertTrue(np.all(np.sum(oriented[:-1] * oriented[1:], axis=1) > 0.99))
+
+    def test_side_direction_axes_use_downward_component_anchor(self):
+        shape = (12, 12, 12)
+        coordinates = np.array([[5, 5, 2], [5, 5, 4], [5, 5, 6]])
+        flat_ids = np.ravel_multi_index(coordinates.T, shape)
+        upward_axes = np.tile(
+            np.array([[0.1, 0.99, 0.0]], dtype=np.float32), (3, 1)
+        )
+
+        oriented = orient_sparse_direction_axes(
+            flat_ids,
+            upward_axes,
+            upward_axes,
+            np.ones(3, dtype=np.int8),
+            shape,
+            preferred_owners=[1],
+        )
+
+        self.assertTrue(np.all(oriented[:, 1] < 0.0))
+
+    def test_front_direction_axes_keep_original_component_anchor(self):
+        shape = (12, 12, 12)
+        coordinates = np.array([[5, 5, 2], [5, 5, 4]])
+        flat_ids = np.ravel_multi_index(coordinates.T, shape)
+        upward_axes = np.tile(
+            np.array([[0.1, 0.99, 0.0]], dtype=np.float32), (2, 1)
+        )
+
+        oriented = orient_sparse_direction_axes(
+            flat_ids,
+            upward_axes,
+            upward_axes,
+            np.zeros(2, dtype=np.int8),
+            shape,
+            preferred_owners=[1],
+        )
+
+        self.assertTrue(np.all(oriented[:, 1] > 0.0))
+
+    def test_direction_normal_component_is_clamped_without_losing_sign(self):
+        directions = np.array(
+            [[0.6, -0.8, 0.0], [-0.6, -0.8, 0.0], [0.2, -0.98, 0.0]],
+            dtype=np.float32,
+        )
+        directions /= np.linalg.norm(directions, axis=1, keepdims=True)
+        normals = np.tile(np.array([[1.0, 0.0, 0.0]], dtype=np.float32), (3, 1))
+
+        limited, changed = limit_direction_normal_component(
+            directions, normals, max_component=0.3
+        )
+
+        self.assertTrue(np.array_equal(changed, [True, True, False]))
+        self.assertTrue(np.all(np.abs(limited[:, 0]) <= 0.30001))
+        self.assertTrue(np.all(limited[:, 1] < 0.0))
+        self.assertTrue(np.allclose(np.linalg.norm(limited, axis=1), 1.0))
 
     def test_hair_surface_occlusion_makes_front_background_abstain(self):
         distant_head = o3d.geometry.TriangleMesh.create_sphere(

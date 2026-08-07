@@ -35,6 +35,7 @@ from lib.multiview_fusion import (
     compute_root_head_visibility,
     extract_view_mesh_surface_contribution,
     fuse_multiview_orientation,
+    orient_sparse_direction_axes,
     save_mesh_root_projections,
     trace_view_strands_3d,
 )
@@ -100,6 +101,7 @@ def hair_synthesis_rk4(
     guide_indices=None,
     div_map_t=None,
     valid_cluster_mask=None,
+    fallback_steps=12,
 ):
     """Trace strands with RK4 integration and continuous collision response."""
     num_strands = root_tensor.shape[2]
@@ -110,21 +112,30 @@ def hair_synthesis_rk4(
     hair_strands[0] = current
     previous_direction = None
 
+    def query_direction(points, allow_fallback):
+        direction = strategy.query(points, calib_tensor).squeeze(0)
+        low = torch.norm(direction, dim=0) < 0.05
+        if allow_fallback and low.any() and hasattr(strategy, "query_fallback"):
+            fallback = strategy.query_fallback(points, calib_tensor).squeeze(0)
+            direction = torch.where(low.unsqueeze(0), fallback, direction)
+        return direction
+
     for index in range(1, num_sample):
-        k1 = strategy.query(current.unsqueeze(0), calib_tensor).squeeze(0)
+        allow_fallback = index <= int(fallback_steps)
+        k1 = query_direction(current.unsqueeze(0), allow_fallback)
         if previous_direction is not None:
             k1 = align_vector_sign(k1, previous_direction)
-        k2 = strategy.query(
-            (current + 0.5 * hair_unit * k1).unsqueeze(0), calib_tensor
-        ).squeeze(0)
+        k2 = query_direction(
+            (current + 0.5 * hair_unit * k1).unsqueeze(0), allow_fallback
+        )
         k2 = align_vector_sign(k2, k1)
-        k3 = strategy.query(
-            (current + 0.5 * hair_unit * k2).unsqueeze(0), calib_tensor
-        ).squeeze(0)
+        k3 = query_direction(
+            (current + 0.5 * hair_unit * k2).unsqueeze(0), allow_fallback
+        )
         k3 = align_vector_sign(k3, k2)
-        k4 = strategy.query(
-            (current + hair_unit * k3).unsqueeze(0), calib_tensor
-        ).squeeze(0)
+        k4 = query_direction(
+            (current + hair_unit * k3).unsqueeze(0), allow_fallback
+        )
         k4 = align_vector_sign(k4, k3)
         direction = (k1 + 2 * k2 + 2 * k3 + k4) / 6.0
         if previous_direction is not None:
@@ -313,6 +324,12 @@ def main():
     parser.add_argument("--pde_cg_tol", type=float, default=1e-4)
     parser.add_argument("--pde_cg_maxiter", type=int, default=2000)
     parser.add_argument("--pde_anisotropy", type=float, default=0.8)
+    parser.add_argument(
+        "--pde_max_normal_component",
+        type=float,
+        default=0.30,
+        help="Maximum absolute hair-mesh normal component in the multi-view field",
+    )
     parser.add_argument("--pde_alpha_mix", type=float, default=3.0,
                         help="2nd-order Laplacian weight (higher = better CG convergence)")
     parser.add_argument("--pde_beta_mix", type=float, default=1.0,
@@ -323,6 +340,12 @@ def main():
                         help="Depth tolerance for other views")
     parser.add_argument("--num_sample", type=int, default=100)
     parser.add_argument("--hair_unit", type=float, default=0.006)
+    parser.add_argument(
+        "--pde_fallback_steps",
+        type=int,
+        default=12,
+        help="Early RK4 steps allowed to use nearest-valid PDE direction",
+    )
     parser.add_argument(
         "--export-per-view",
         action="store_true",
@@ -682,15 +705,35 @@ def main():
     flip = np.sum(fused_directions * reference, axis=1) < 0.0
     fused_directions[flip] *= -1.0
 
+    fused_ownership = np.minimum.reduceat(contributing_views, starts)
+    gravity_oriented_owners = [
+        view_id for view_id, view in enumerate(valid_views)
+        if view != "front"
+    ]
+    fused_directions = orient_sparse_direction_axes(
+        unique_ids,
+        fused_directions,
+        reference,
+        fused_ownership,
+        shape,
+        preferred_owners=gravity_oriented_owners,
+    )
+    for view_id, view in enumerate(valid_views):
+        owned = fused_ownership == view_id
+        if owned.any():
+            downward = np.mean(fused_directions[owned, 1] < 0.0)
+            print(
+                f"  {view} oriented boundary: "
+                f"{100.0 * downward:.1f}% world-down"
+            )
+
     fused_orien = np.zeros_like(fused_orien)
     boundary_mask = np.zeros_like(boundary_mask)
     view_ownership = np.full_like(view_ownership, -1)
     fused_flat = fused_orien.reshape(3, -1)
     fused_flat[:, unique_ids] = fused_directions.T
     boundary_mask.ravel()[unique_ids] = True
-    view_ownership.ravel()[unique_ids] = np.minimum.reduceat(
-        contributing_views, starts
-    )
+    view_ownership.ravel()[unique_ids] = fused_ownership
     # Match the single-view PDE's physical length control: use a metric band
     # around the hair mesh rather than a resolution-dependent voxel dilation.
     seg_support_volume = build_multiview_seg_support_volume(
@@ -771,6 +814,7 @@ def main():
     opt_pde.pde_cg_tol = args.pde_cg_tol
     opt_pde.pde_cg_maxiter = args.pde_cg_maxiter
     opt_pde.pde_anisotropy = args.pde_anisotropy
+    opt_pde.pde_max_normal_component = args.pde_max_normal_component
     opt_pde.pde_alpha_mix = args.pde_alpha_mix
     opt_pde.pde_beta_mix = args.pde_beta_mix
     opt_pde.b_min = b_min_val
@@ -790,7 +834,10 @@ def main():
     else:
         strategy = LaplacePDEStrategy(opt_pde, cuda)
         print("  Using original front-only orientation field")
-    strategy.filter(data, mesh_path=args.mesh_obj)
+    strategy.filter(
+        data,
+        mesh_path=aligned_surface_path if has_side_views else args.mesh_obj,
+    )
     strategy.set_query_mode("orien")
 
     # Keep the solved orientation inside the narrow PDE domain. Expanding it
@@ -950,6 +997,7 @@ def main():
     guide_strands = hair_synthesis_rk4(
         strategy, cuda, guide_roots, calib_tensor,
         num_sample=args.num_sample, hair_unit=args.hair_unit,
+        fallback_steps=args.pde_fallback_steps,
         sdf_vol=sdf_vol, normal_vol=normal_vol,
         b_min_t=b_min_t, b_max_t=b_max_t,
     )
@@ -964,6 +1012,7 @@ def main():
     strands = hair_synthesis_rk4(
         strategy, cuda, root_tensor, calib_tensor,
         num_sample=args.num_sample, hair_unit=args.hair_unit,
+        fallback_steps=args.pde_fallback_steps,
         sdf_vol=sdf_vol, normal_vol=normal_vol,
         b_min_t=b_min_t, b_max_t=b_max_t,
         noise_vol=noise_vol,
