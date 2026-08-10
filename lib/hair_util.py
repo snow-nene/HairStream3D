@@ -103,6 +103,67 @@ def save_strands_with_mesh(strands, mesh_path, outputpath, err=0.3, is_eval=Fals
     print(f"[Strand Pruning] Filtered out short strands (< {min_len*100:.1f} cm). Kept {len(lst_pc_all_valid)} / {strands.shape[0]} strands.")
 
 
+def trim_strands_by_silhouette(
+    strands,
+    guard,
+    trim_margin_px=1.0,
+    min_keep_points=2,
+    chunk_size=50000,
+):
+    """保存前的最后一道 silhouette 防线。
+
+    对固定形状 [N, num_sample, 3] 的发丝数组：
+    1. 逐点用 SilhouetteGuard 判定（容差收紧为 trim_margin_px），在第一个
+       明显越界 (HARD) 的点处截断发丝；
+    2. 压缩被 RK4 guard 冻结后遗留的尾部重复点；
+    3. 截断后不足 min_keep_points 个点的发丝整体置零（save_strands_with_mesh
+       会自动跳过原点发丝）。
+
+    输出保持与输入相同的形状：截断处用末点重复填充（零长线段不参与渲染）。
+    """
+    num_strands, num_samples, _ = strands.shape
+    flat = np.asarray(strands, dtype=np.float32).reshape(-1, 3)
+    hard = np.zeros(flat.shape[0], dtype=bool)
+    for start in range(0, flat.shape[0], chunk_size):
+        stop = min(start + chunk_size, flat.shape[0])
+        status = guard.classify(flat[start:stop], hard_px=trim_margin_px)
+        hard[start:stop] = status == 2
+    hard = hard.reshape(num_strands, num_samples)
+
+    # 第一个 HARD 点之前保留；无越界则保留全部
+    has_hard = hard.any(axis=1)
+    first_hard = np.argmax(hard, axis=1)
+    keep_len = np.where(has_hard, first_hard, num_samples).astype(np.int64)
+
+    # 压缩尾部冻结产生的重复点（相邻段长 ~0）
+    seg_len = np.linalg.norm(strands[:, 1:] - strands[:, :-1], axis=2)
+    moving = seg_len > 1e-7  # [N, num_samples-1]
+    seg_idx = np.arange(num_samples - 1)[None, :]
+    valid_seg = moving & (seg_idx < (keep_len - 1)[:, None])
+    has_move = valid_seg.any(axis=1)
+    last_move = (num_samples - 1) - np.argmax(valid_seg[:, ::-1], axis=1)
+    final_len = np.where(has_move, last_move + 2, 1).astype(np.int64)
+    final_len = np.minimum(final_len, keep_len)
+
+    dropped = int((final_len < min_keep_points).sum())
+    cut_points = int((num_samples - np.maximum(final_len, 1)).sum())
+
+    out = np.zeros_like(strands)
+    for i in range(num_strands):
+        length = int(final_len[i])
+        if length < min_keep_points:
+            continue  # 置零 → save_strands_with_mesh 跳过
+        out[i, :length] = strands[i, :length]
+        if length < num_samples:
+            out[i, length:] = strands[i, length - 1]
+
+    print(
+        f"[Silhouette Trim] margin={trim_margin_px}px: cut {cut_points} "
+        f"outside/frozen points, dropped {dropped}/{num_strands} strands"
+    )
+    return out
+
+
 def save_polyline_strands(curves, outputpath):
     """Save variable-length 3D polyline curves as an Open3D LineSet."""
     points = []

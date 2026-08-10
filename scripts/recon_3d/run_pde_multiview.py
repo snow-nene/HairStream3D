@@ -102,8 +102,19 @@ def hair_synthesis_rk4(
     div_map_t=None,
     valid_cluster_mask=None,
     fallback_steps=12,
+    silhouette_guard=None,
+    silhouette_grace_steps=3,
+    label="",
 ):
-    """Trace strands with RK4 integration and continuous collision response."""
+    """Trace strands with RK4 integration and continuous collision response.
+
+    silhouette_guard (SilhouetteGuard): 可见性驱动的轮廓硬约束。每步把候选
+    点投影回输入视角：明显越过 seg 的发丝立即停止（冻结在最后合法位置），
+    刚越界 (<= tolerance_px) 的发丝进入 grace 期并允许 fallback 方向帮助其
+    回到轮廓内部。
+    """
+    from lib.silhouette_guard import STATUS_HARD, STATUS_SOFT
+
     num_strands = root_tensor.shape[2]
     hair_strands = torch.zeros(
         num_sample, 3, num_strands, device=cuda
@@ -112,29 +123,38 @@ def hair_synthesis_rk4(
     hair_strands[0] = current
     previous_direction = None
 
-    def query_direction(points, allow_fallback):
+    alive = torch.ones(num_strands, dtype=torch.bool, device=cuda)
+    grace_budget = max(0, int(silhouette_grace_steps))
+    grace_left = torch.full(
+        (num_strands,), grace_budget, dtype=torch.long, device=cuda
+    )
+    need_fallback = torch.zeros(num_strands, dtype=torch.bool, device=cuda)
+    dead_total = 0
+
+    def query_direction(points, fallback_mask):
         direction = strategy.query(points, calib_tensor).squeeze(0)
         low = torch.norm(direction, dim=0) < 0.05
-        if allow_fallback and low.any() and hasattr(strategy, "query_fallback"):
+        use_fallback = low & fallback_mask
+        if use_fallback.any() and hasattr(strategy, "query_fallback"):
             fallback = strategy.query_fallback(points, calib_tensor).squeeze(0)
-            direction = torch.where(low.unsqueeze(0), fallback, direction)
+            direction = torch.where(use_fallback.unsqueeze(0), fallback, direction)
         return direction
 
     for index in range(1, num_sample):
-        allow_fallback = index <= int(fallback_steps)
-        k1 = query_direction(current.unsqueeze(0), allow_fallback)
+        fallback_mask = (index <= int(fallback_steps)) | need_fallback
+        k1 = query_direction(current.unsqueeze(0), fallback_mask)
         if previous_direction is not None:
             k1 = align_vector_sign(k1, previous_direction)
         k2 = query_direction(
-            (current + 0.5 * hair_unit * k1).unsqueeze(0), allow_fallback
+            (current + 0.5 * hair_unit * k1).unsqueeze(0), fallback_mask
         )
         k2 = align_vector_sign(k2, k1)
         k3 = query_direction(
-            (current + 0.5 * hair_unit * k2).unsqueeze(0), allow_fallback
+            (current + 0.5 * hair_unit * k2).unsqueeze(0), fallback_mask
         )
         k3 = align_vector_sign(k3, k2)
         k4 = query_direction(
-            (current + hair_unit * k3).unsqueeze(0), allow_fallback
+            (current + hair_unit * k3).unsqueeze(0), fallback_mask
         )
         k4 = align_vector_sign(k4, k3)
         direction = (k1 + 2 * k2 + 2 * k3 + k4) / 6.0
@@ -198,7 +218,58 @@ def hair_synthesis_rk4(
             collision_mask = (penetration > 0).float()
             current = current + collision_mask * penetration * normal
 
+        if silhouette_guard is not None and alive.any():
+            # 可见性驱动的 silhouette 硬约束：只检查仍存活的发丝
+            if alive.all():
+                check_idx = None
+                check_pts = current
+            else:
+                check_idx = torch.nonzero(alive, as_tuple=False).squeeze(1)
+                check_pts = current[:, check_idx]
+            status_np = silhouette_guard.classify(
+                check_pts.detach().cpu().numpy().T
+            )
+            status_t = torch.from_numpy(status_np.astype(np.int64)).to(cuda)
+            hard = status_t == STATUS_HARD
+            soft = status_t == STATUS_SOFT
+            if check_idx is None:
+                grace_left = torch.where(
+                    soft, grace_left - 1, torch.full_like(grace_left, grace_budget)
+                )
+                newly_dead = hard | (soft & (grace_left < 0))
+                alive = alive & ~newly_dead
+                need_fallback = alive & soft
+                dead_step = int(newly_dead.sum())
+                current = torch.where(alive.unsqueeze(0), current, hair_strands[index - 1])
+            else:
+                sub_grace = grace_left[check_idx]
+                sub_grace = torch.where(
+                    soft, sub_grace - 1, torch.full_like(sub_grace, grace_budget)
+                )
+                grace_left[check_idx] = sub_grace
+                newly_dead_sub = hard | (soft & (sub_grace < 0))
+                dead_idx = check_idx[newly_dead_sub]
+                alive[dead_idx] = False
+                need_fallback = torch.zeros_like(need_fallback)
+                need_fallback[check_idx[soft & ~newly_dead_sub]] = True
+                dead_step = int(newly_dead_sub.sum())
+                if dead_step:
+                    current[:, dead_idx] = hair_strands[index - 1, :, dead_idx]
+            dead_total += dead_step
+            if index % 25 == 0 or index == num_sample - 1:
+                print(
+                    f"    [{label or 'rk4'}] step {index}: "
+                    f"alive={int(alive.sum())}/{num_strands}, "
+                    f"stopped so far={dead_total}"
+                )
+
         hair_strands[index] = current
+
+    if silhouette_guard is not None:
+        print(
+            f"  [{label or 'rk4'}] silhouette guard: stopped "
+            f"{dead_total}/{num_strands} strands outside the input silhouette"
+        )
 
     return hair_strands.permute(2, 0, 1).cpu().detach().numpy()
 
@@ -345,6 +416,31 @@ def main():
         type=int,
         default=12,
         help="Early RK4 steps allowed to use nearest-valid PDE direction",
+    )
+    parser.add_argument(
+        "--silhouette_hard_px",
+        type=float,
+        default=20.0,
+        help="Immediate-stop depth outside the input hair seg in pixels "
+             "(shallower excursions use the grace mechanism, default: 20.0)",
+    )
+    parser.add_argument(
+        "--silhouette_grace_steps",
+        type=int,
+        default=12,
+        help="Max consecutive RK4 steps a strand may stay outside the seg "
+             "(grace for transient hairline excursions, default: 12)",
+    )
+    parser.add_argument(
+        "--silhouette_trim_margin_px",
+        type=float,
+        default=1.0,
+        help="Save-stage silhouette trim margin in pixels (default: 1.0)",
+    )
+    parser.add_argument(
+        "--disable_silhouette_guard",
+        action="store_true",
+        help="Disable the visibility-driven silhouette constraint (ablation)",
     )
     parser.add_argument(
         "--export-per-view",
@@ -630,6 +726,25 @@ def main():
                 interpolation=cv2.INTER_NEAREST,
             )
         seg_masks[view] = seg > 127
+
+    silhouette_guard = None
+    if not args.disable_silhouette_guard:
+        from lib.silhouette_guard import SilhouetteGuard
+
+        primary_view = "front" if "front" in seg_masks else valid_views[0]
+        silhouette_guard = SilhouetteGuard(
+            seg_masks=seg_masks,
+            calibs=calibs,
+            head_mesh_path="data/head_model.obj",
+            hard_px=args.silhouette_hard_px,
+            primary_view=primary_view,
+        )
+        print(
+            f"  {silhouette_guard.summary()}: RK4 growth is silhouette-constrained "
+            f"(grace={args.silhouette_grace_steps} steps)"
+        )
+    else:
+        print("  Silhouette guard DISABLED (--disable_silhouette_guard)")
 
     hair_volume, raw_surface_shell, shell_counts = build_visible_mesh_surface_shell(
         aligned_surface_path,
@@ -1000,6 +1115,9 @@ def main():
         fallback_steps=args.pde_fallback_steps,
         sdf_vol=sdf_vol, normal_vol=normal_vol,
         b_min_t=b_min_t, b_max_t=b_max_t,
+        silhouette_guard=silhouette_guard,
+        silhouette_grace_steps=args.silhouette_grace_steps,
+        label="guides",
     )
     guide_strands_t = (
         torch.from_numpy(guide_strands).to(cuda).permute(1, 2, 0)
@@ -1020,12 +1138,23 @@ def main():
         guide_indices=guide_indices_t,
         div_map_t=div_map_t,
         valid_cluster_mask=valid_cluster_mask,
+        silhouette_guard=silhouette_guard,
+        silhouette_grace_steps=args.silhouette_grace_steps,
+        label="strands",
     )
 
     # ================================================================
     #  7. Save
     # ================================================================
     print(f"\nStep 7: Clipping & saving to {out_ply}...")
+    if silhouette_guard is not None:
+        from lib.hair_util import trim_strands_by_silhouette
+
+        strands = trim_strands_by_silhouette(
+            strands,
+            silhouette_guard,
+            trim_margin_px=args.silhouette_trim_margin_px,
+        )
     save_strands_with_mesh(strands, args.mesh_obj, out_ply, 0.3, is_eval=False)
 
     if args.export_per_view:

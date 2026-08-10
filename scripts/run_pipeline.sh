@@ -124,6 +124,27 @@ set -e
 DATA_DIR="results/multiview_data/${IMG_ID}"
 mkdir -p "$DATA_DIR"
 
+# ==== 自动将原始输入图拷贝一份到数据目录 ====
+# 保证各阶段都能从数据目录内取回原图 (raw_img.<ext>)，不依赖外部路径
+# （外部路径可能被移动/删除），避免 front mask 被迫用网格渲染图重算。
+SRC_IMG="$RAW_IMG"
+if [ -z "$SRC_IMG" ] && [ -f "${DATA_DIR}/raw_img_path.txt" ]; then
+    SRC_IMG=$(cat "${DATA_DIR}/raw_img_path.txt")
+fi
+if [ -n "$SRC_IMG" ] && [ -f "$SRC_IMG" ]; then
+    EXT="${SRC_IMG##*.}"
+    if [ "$EXT" = "$SRC_IMG" ]; then
+        EXT="png"
+    fi
+    RAW_COPY="${DATA_DIR}/raw_img.${EXT}"
+    if [ -n "$RAW_IMG" ] || [ ! -f "$RAW_COPY" ]; then
+        cp "$SRC_IMG" "$RAW_COPY"
+        echo " [INFO] 已拷贝原始输入图到 ${RAW_COPY}"
+    fi
+else
+    echo " [WARN] 未找到原始输入图 (RAW_IMG=${RAW_IMG:-未设置})，跳过 raw_img 拷贝。"
+fi
+
 if run_stage "prepare"; then
     echo "=================================================="
     echo " [0/5] Prepare: 抠图并提取 2D 特征图"
@@ -286,7 +307,25 @@ if run_stage "maps"; then
     echo "=================================================="
     echo " [4/5] Maps: 提取多视角 2D 特征图 (${VIEWS[*]})"
     echo "=================================================="
-    FRONT_IMG="${DATA_DIR}/blender_renders/front.png"
+    # front 的 mask/depth 必须基于原始照片计算；blender_renders/front.png
+    # 在 render 阶段后已被 3D 网格渲染图覆盖，不能用作 front 输入。
+    # 优先级：数据目录内的 raw_img.* 拷贝 > raw_img_path.txt 记录的外部路径 > blender_renders/front.png
+    FRONT_IMG=""
+    for cand in "${DATA_DIR}"/raw_img.*; do
+        if [ -f "$cand" ]; then
+            FRONT_IMG="$cand"
+            break
+        fi
+    done
+    if [ -z "$FRONT_IMG" ] && [ -f "${DATA_DIR}/raw_img_path.txt" ]; then
+        RAW_IMG_PATH=$(cat "${DATA_DIR}/raw_img_path.txt")
+        if [ -f "$RAW_IMG_PATH" ]; then
+            FRONT_IMG="$RAW_IMG_PATH"
+        fi
+    fi
+    if [ -z "$FRONT_IMG" ]; then
+        FRONT_IMG="${DATA_DIR}/blender_renders/front.png"
+    fi
     FRONT_STRAND="${DATA_DIR}/maps/strand_map/front.png"
     FRONT_DEPTH="${DATA_DIR}/maps/depth_map/front.npy"
     

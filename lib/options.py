@@ -16,6 +16,27 @@ class BaseOptions():
 
         parser.add_argument("--checkpoint_sam", type=str, default='./checkpoints/SAM-models/sam_vit_h_4b8939.pth',
                             help="The path to the SAM checkpoint to use for mask generation.")
+
+        # ── SAM3 头发分割（seg backend）──────────────────────────────
+        parser.add_argument("--seg_backend", type=str, default='sam3', choices=['sam3', 'sam'],
+                            help="抠图后端: sam3=文本提示 SAM3(默认, 需 ext/sam3 环境), sam=旧版点提示 SAM ViT-H")
+        parser.add_argument("--sam3_root", type=str, default='./ext/sam3',
+                            help="SAM3 仓库根目录（含其独立 pixi 环境 .pixi/envs/default）")
+        parser.add_argument("--checkpoint_sam3", type=str,
+                            default='./ext/sam3/checkpoints/facebook/sam3.1/sam3.1_multiplex.pt',
+                            help="SAM3 checkpoint 路径")
+        parser.add_argument("--sam3_conf_threshold", type=float, default=0.3,
+                            help="SAM3 检测置信度阈值")
+        parser.add_argument("--sam3_max_input_size", type=int, default=2048,
+                            help="SAM3 分割输入的最长边上限；保留高分辨率细发丝，输出仍按 loadSize 对齐")
+        parser.add_argument("--sam3_hair_prompts", type=str, nargs='+',
+                            default=["hair", "ponytail hair and twin tails", "bangs and hair on the front"],
+                            help="SAM3 头发文本提示列表（结果取并集）")
+        parser.add_argument("--sam3_body_prompt", type=str, default="person",
+                            help="SAM3 身体文本提示（生成 body_img）")
+        parser.add_argument("--sam3_person_selection", type=str, default="largest",
+                            choices=["largest", "all"],
+                            help="SAM3 多人场景处理: largest=综合评分选择主人物及其头发; all=所有人")
         parser.add_argument("--checkpoint_img2strand", type=str, default='./checkpoints/img2hairstep/img2strand.pth',
                             help="The path to the checkpoint of img2strand.")
         parser.add_argument("--checkpoint_img2depth", type=str, default='./checkpoints/img2hairstep/img2depth.pth',

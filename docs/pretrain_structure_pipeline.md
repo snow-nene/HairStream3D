@@ -34,18 +34,23 @@ checkpoints/img2hairstep/hrnet_w32/  (最终模型)
 
 ---
 
-## Step 1: 批量生成头发 mask（SAM 抠图）
+## Step 1: 批量生成头发 mask（SAM3/SAM 抠图）
 
 ### 输入
 - `datasets/0002.mqset/**/*.jpg`（48,252 张，31 个分类文件夹）
 
 ### 输出
 - `datasets/pretrain/img/{hash}.png` — pad+resize 到 512×512 的 RGB 图像
-- `datasets/pretrain/seg/{hash}.png` — SAM 生成的头发区域 mask（0/255）
+- `datasets/pretrain/seg/{hash}.png` — SAM3（默认）或 SAM 生成的头发区域 mask（0/255）
 
 ### 实现
 - `scripts/train/batch_generate_masks.py`
-- 复用 `scripts/infer_2d/img2masks.py` 的 `pad_and_resize` + `SamPredictor` 逻辑
+- 默认 `--seg_backend sam3`：subprocess 调用 `ext/sam3` 独立环境中的
+  `scripts/infer_2d/sam3_seg_worker.py`（文本提示 + 形态学后处理）；
+  `--seg_backend sam` 回退旧版 `SamPredictor` 点提示逻辑
+- 多人场景默认只抠**主人物**及其头发（`--sam3_person_selection largest`）：
+  person 实例先做高 IoU 去重，再综合中心位置、头发占比、面积和边界占用率选择主角；
+  头发按整体重叠率和稳健距离归属，仅保留主角的头发；传 `all` 恢复"抠所有人"的旧行为
 - 使用文件内容的 MD5 hash 作为文件名，避免重名
 
 ### 运行

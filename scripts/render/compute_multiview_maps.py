@@ -2,7 +2,8 @@
 compute_multiview_maps.py - Compute strand_map & depth_map for multi-view images.
 
 Pipeline (per view):
-  1. SAM → hair mask (seg) + body mask (body_img)
+  1. SAM/SAM3 → hair mask (seg) + body mask (body_img)
+     (backend via --seg_backend, default sam3: text-prompt SAM3 in its own pixi env)
   2. img2strand → strand_map  (2D orientation)
   3. img2depth  → depth_map   (normalized depth)
 
@@ -42,7 +43,7 @@ sys.path.insert(0, ROOT)
 from lib.options import BaseOptions
 from lib.model.img2hairstep.model_factory import create_img2strand_model
 from lib.model.img2hairstep.hourglass import Model as DepthModel
-from segment_anything import SamPredictor, sam_model_registry
+# segment_anything 在 --seg_backend sam 分支内懒加载
 from skimage.transform import resize as skresize
 
 import matplotlib
@@ -74,6 +75,77 @@ def pad_to_square(img):
 
 
 # ── SAM mask generation ────────────────────────────────────────────
+
+def stage_resized(image_path, staged_path, max_size=2048):
+    """高分辨率正方形 padding，SAM3 推理后再将 mask 对齐到 512。"""
+    img = imageio.imread(image_path)[:, :, 0:3]
+    height, width = img.shape[:2]
+    side = max(height, width)
+    pad_top = (side - height) // 2
+    pad_bottom = side - height - pad_top
+    pad_left = (side - width) // 2
+    pad_right = side - width - pad_left
+    padded = np.pad(
+        img,
+        ((pad_top, pad_bottom), (pad_left, pad_right), (0, 0)),
+        mode="constant",
+    )
+    if max_size > 0 and side > max_size:
+        padded = skresize(
+            padded, (max_size, max_size), preserve_range=True,
+            anti_aliasing=True,
+        ).astype(np.uint8)
+    imageio.imwrite(staged_path, padded)
+
+
+def run_sam3_masks(items, args):
+    """调用 SAM3 独立 pixi 环境中的 worker 一次性处理所有视角。
+
+    Args:
+        items: [(staged_input_png, seg_out_png, body_out_png), ...]
+    """
+    import json
+    import subprocess
+
+    sam3_root = os.path.abspath(args.sam3_root)
+    sam3_python = os.path.join(sam3_root, ".pixi", "envs", "default", "bin", "python")
+    checkpoint = os.path.abspath(args.checkpoint_sam3)
+    worker = os.path.join(ROOT, "scripts", "infer_2d", "sam3_seg_worker.py")
+
+    if not os.path.isfile(sam3_python):
+        raise RuntimeError(
+            f"找不到 SAM3 独立环境解释器: {sam3_python}\n"
+            f"请先在 {sam3_root} 执行 `pixi install`，或改用 --seg_backend sam")
+    if not os.path.isfile(checkpoint):
+        raise RuntimeError(
+            f"找不到 SAM3 checkpoint: {checkpoint}\n"
+            f"请用 --checkpoint_sam3 指定，或改用 --seg_backend sam")
+
+    manifest = os.path.join(args.out_dir, "_sam3_manifest.json")
+    with open(manifest, "w") as f:
+        json.dump({"items": [
+            {"input": i, "seg_out": s, "body_out": b} for i, s, b in items
+        ]}, f, indent=2)
+
+    cmd = [
+        sam3_python, worker,
+        "--manifest", manifest,
+        "--checkpoint", checkpoint,
+        "--hair_prompts", *[str(x) for x in args.sam3_hair_prompts],
+        "--body_prompt", args.sam3_body_prompt,
+        "--person_selection", args.sam3_person_selection,
+        "--conf_threshold", str(args.sam3_conf_threshold),
+        "--output_size", str(IMG_SIZE),
+        "--mask_channels", "3",   # 与 generate_masks_sam 输出一致: 三通道 0/255
+        "--device", args.device,
+    ]
+    print("running SAM3 worker:", " ".join(cmd))
+    try:
+        subprocess.run(cmd, check=True)
+    finally:
+        if os.path.exists(manifest):
+            os.remove(manifest)
+
 
 def generate_masks_sam(image_path, sam_predictor, device):
     """Run SAM on a single image → hair mask + body mask.
@@ -259,6 +331,23 @@ def main():
     parser.add_argument("--checkpoint_img2depth",
                         default=os.path.join(ROOT, "checkpoints/img2hairstep/img2depth.pth"))
     parser.add_argument("--model_type_sam", default="vit_h")
+    parser.add_argument("--seg_backend", choices=["sam3", "sam"], default="sam3",
+                        help="遮罩后端: sam3=文本提示 SAM3(默认), sam=旧版点提示 SAM ViT-H")
+    parser.add_argument("--sam3_root", default=os.path.join(ROOT, "ext", "sam3"),
+                        help="SAM3 仓库根目录（含独立 pixi 环境）")
+    parser.add_argument("--checkpoint_sam3",
+                        default=os.path.join(ROOT, "ext", "sam3", "checkpoints",
+                                             "facebook", "sam3.1", "sam3.1_multiplex.pt"))
+    parser.add_argument("--sam3_conf_threshold", type=float, default=0.3)
+    parser.add_argument("--sam3_max_input_size", type=int, default=2048,
+                        help="SAM3 分割输入最长边上限；输出 mask 始终为 512")
+    parser.add_argument("--sam3_hair_prompts", nargs="+",
+                        default=["hair", "ponytail hair and twin tails",
+                                 "bangs and hair on the front"])
+    parser.add_argument("--sam3_body_prompt", default="person")
+    parser.add_argument("--sam3_person_selection", default="largest",
+                        choices=["largest", "all"],
+                        help="largest=综合评分选择主人物及其头发; all=所有人")
     args = parser.parse_args()
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
@@ -273,11 +362,37 @@ def main():
     for d in [out_strand, out_depth, out_depth_vis, out_seg, out_body]:
         os.makedirs(d, exist_ok=True)
 
-    # ── Load SAM ───────────────────────────────────────────────────
-    print("Loading SAM...")
-    sam = sam_model_registry[args.model_type_sam](checkpoint=args.checkpoint_sam)
-    sam.to(device=device)
-    predictor = SamPredictor(sam)
+    # ── Load mask backend ──────────────────────────────────────────
+    predictor = None
+    if args.seg_backend == "sam":
+        from segment_anything import SamPredictor, sam_model_registry
+        print("Loading SAM...")
+        sam = sam_model_registry[args.model_type_sam](checkpoint=args.checkpoint_sam)
+        sam.to(device=device)
+        predictor = SamPredictor(sam)
+    else:
+        # SAM3: 先把所有视角图片 pad+resize 到 512 落盘，再一次性跑 worker
+        import shutil
+        view_inputs = {"front": args.front_img}
+        for view in args.views:
+            img_path = os.path.join(args.render_dir, f"{view}.png")
+            if not os.path.exists(img_path):
+                img_path = os.path.join(args.render_dir, f"{view}_hair.png")
+            if os.path.exists(img_path):
+                view_inputs[view] = img_path
+            else:
+                print(f"[WARN] {view}.png / {view}_hair.png not found in {args.render_dir}")
+        staged_dir = os.path.join(args.out_dir, "_sam3_input")
+        os.makedirs(staged_dir, exist_ok=True)
+        items = []
+        for view, raw_path in view_inputs.items():
+            staged = os.path.join(staged_dir, f"{view}.png")
+            stage_resized(raw_path, staged, args.sam3_max_input_size)
+            items.append((staged,
+                          os.path.join(out_seg, f"{view}.png"),
+                          os.path.join(out_body, f"{view}.png")))
+        run_sam3_masks(items, args)
+        shutil.rmtree(staged_dir, ignore_errors=True)
 
     # ── Load strand & depth models ─────────────────────────────────
     print("Loading strand model...")
@@ -313,11 +428,16 @@ def main():
     imageio.imwrite(os.path.join(out_strand, "front.png"), front_strand_u8)
     print(f"  strand_map: {front_strand_u8.shape} — COPIED (R channel cleaned to 0/255)")
 
-    # SAM mask for front depth
-    print("  Running SAM for front mask...")
-    hair_mask_rgb, body_mask_rgb = generate_masks_sam(args.front_img, predictor, device)
-    cv2.imwrite(os.path.join(out_seg, "front.png"), hair_mask_rgb)
-    cv2.imwrite(os.path.join(out_body, "front.png"), body_mask_rgb)
+    # Mask for front depth
+    if args.seg_backend == "sam":
+        print("  Running SAM for front mask...")
+        hair_mask_rgb, body_mask_rgb = generate_masks_sam(args.front_img, predictor, device)
+        cv2.imwrite(os.path.join(out_seg, "front.png"), hair_mask_rgb)
+        cv2.imwrite(os.path.join(out_body, "front.png"), body_mask_rgb)
+    else:
+        print("  Using SAM3 front mask (precomputed)")
+    hair_mask_rgb = imageio.imread(os.path.join(out_seg, "front.png"))
+    body_mask_rgb = imageio.imread(os.path.join(out_body, "front.png"))
     front_hair_mask = (hair_mask_rgb[:, :, 0:1] / 255.0 > 0.5)
 
     # Front depth
@@ -347,11 +467,16 @@ def main():
             print(f"  [SKIP] {view}.png / {view}_hair.png not found in {args.render_dir}")
             continue
 
-        # 2a. SAM masks
-        print(f"  Running SAM...")
-        hair_mask_rgb, body_mask_rgb = generate_masks_sam(img_path, predictor, device)
-        cv2.imwrite(os.path.join(out_seg, f"{view}.png"), hair_mask_rgb)
-        cv2.imwrite(os.path.join(out_body, f"{view}.png"), body_mask_rgb)
+        # 2a. Masks
+        if args.seg_backend == "sam":
+            print(f"  Running SAM...")
+            hair_mask_rgb, body_mask_rgb = generate_masks_sam(img_path, predictor, device)
+            cv2.imwrite(os.path.join(out_seg, f"{view}.png"), hair_mask_rgb)
+            cv2.imwrite(os.path.join(out_body, f"{view}.png"), body_mask_rgb)
+        else:
+            print(f"  Using SAM3 mask (precomputed)")
+            hair_mask_rgb = imageio.imread(os.path.join(out_seg, f"{view}.png"))
+            body_mask_rgb = imageio.imread(os.path.join(out_body, f"{view}.png"))
 
         hair_mask = (hair_mask_rgb[:, :, 0:1] / 255.0 > 0.5)  # (512, 512, 1) bool
         body_mask = (body_mask_rgb[:, :, 0:1] / 255.0 > 0.5)

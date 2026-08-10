@@ -14,6 +14,7 @@
 results/
 └── multiview_data/                                 <-- 多视图中间数据总目录
     └── <image_id>/                                 <-- 单张输入图片的唯一 ID (例如 0a1ba3dbefc8934ab60577c5c91f66a0)
+        ├── raw_img.png                             <-- 0. 原始输入照片拷贝 (run_pipeline.sh 自动写入，扩展名跟随原图)
         ├── blender_renders/                        <-- 1. 基础 3D 模板或单视角先验出多视角 3D 渲染
         │   ├── front.png
         │   ├── left.png
@@ -73,6 +74,19 @@ results/
 * **多视角批量提取 (`scripts/infer_2d/compute_multiview_maps.py`)**：
   * 支持 `--views front left right back` 任意视角列表参数
   * 自动从 `flux_redrawn/` 提取多视角的 `strand_map` 与 `depth_map`，并写入 `maps/` 对应子目录。
+* **抠图（seg）后端说明**：
+  * 默认后端为 **SAM3 文本提示**（`--seg_backend sam3`）。SAM3 运行在 `ext/sam3` 的独立 pixi 环境中
+    （Python≥3.12 / torch≥2.5，与项目主环境不兼容），由 `img2masks.py` / `compute_multiview_maps.py`
+    通过 subprocess 调用 `scripts/infer_2d/sam3_seg_worker.py` 完成分割。
+  * 文本提示默认为 `hair`、`ponytail hair and twin tails`、`bangs and hair on the front` 三者并集，
+    并做形态学闭运算 + 自适应桥接 + 填孔后处理，对侧/背视角比旧版点提示启发式更稳健。
+  * 多人场景默认只抠**主人物**及其头发（`--sam3_person_selection largest`）：
+    person 实例先做高 IoU 去重，再综合中心位置、头发占比、面积和边界占用率选择主角；
+    不合并相互遮挡的不同人物。头发通过整体重叠率和稳健距离归属，仅保留主角的头发；
+    body mask 同样只输出主角。
+    传 `--sam3_person_selection all` 恢复"抠所有人"的旧行为。
+  * 可通过 `--seg_backend sam` 回退旧版 SAM ViT-H 点提示后端。
+  * 输出格式契约不变：`seg/` 为 0/255 二值 mask，`body_img/` 为三通道身体 mask。
 
 ### 2. FLUX.2 视角重绘 (`scripts/infer_2d/flux_redraw_multiview.py`)
   * 支持接收指定视角列表 `--views`（如 `left right back`）
