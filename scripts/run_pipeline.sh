@@ -207,7 +207,7 @@ fi
 
 if run_stage "align_calib"; then
     echo "=========================================="
-    echo " [1.8/5] AlignCalib: 区分保存原图标定 front.npy 与 GLB 模型标定 glb_param.npy"
+    echo " [1.8/5] AlignCalib: 原图、GLB 与 DINOv3+轮廓标定"
     echo "=========================================="
     PARAM_OUT="${DATA_DIR}/maps/param"
     mkdir -p "$PARAM_OUT"
@@ -265,7 +265,28 @@ if run_stage "align_calib"; then
         fi
     fi
 
-    # 3. 运行对齐效果可视化，生成 real_face_alignment.png 供检查
+    # 3. 正式 front 几何标定：DINOv3 稠密对应估计 SO(3)，front seg
+    # 与 Pixal3D 渲染头发 mask 进一步约束二维轮廓。失败时保留旧 front.npy。
+    DENSE_OUT="${PARAM_OUT}/dense_front"
+    DENSE_PARAM="${PARAM_OUT}/front_dense_silhouette.npy"
+    echo "  --> 正在计算 DINOv3 + 头发轮廓 front 标定..."
+    if pixi run python scripts/utils/fit_front_pose_dense.py \
+        --img_id "$IMG_ID" \
+        --image "${INPUT_IMG:-${DATA_DIR}/blender_renders/front.png}" \
+        --out_dir "$DENSE_OUT" \
+        --auto_render_hair_mask \
+        --require_silhouette; then
+        if [ -f "${DENSE_OUT}/front_dense_silhouette.npy" ]; then
+            cp "${DENSE_OUT}/front_dense_silhouette.npy" "$DENSE_PARAM"
+            echo "  ✓ 正式稠密 front 标定已保存: $DENSE_PARAM"
+        else
+            echo "  [WARN] 稠密标定未生成最终参数，PDE 将回退 maps/param/front.npy"
+        fi
+    else
+        echo "  [WARN] DINOv3 + 轮廓标定失败，PDE 将回退 maps/param/front.npy"
+    fi
+
+    # 4. 运行对齐效果可视化，生成 real_face_alignment.png 供检查
     pixi run python scripts/utils/vis_calib_alignment.py \
         --img_id "$IMG_ID" \
         --out_dir "$PARAM_OUT"

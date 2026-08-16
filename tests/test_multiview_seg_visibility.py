@@ -7,11 +7,13 @@ import open3d as o3d
 
 from lib.multiview_fusion import (
     align_vector_sign,
+    build_mesh_root_guidance,
     build_mesh_metric_band,
     build_multiview_seg_support_volume,
     limit_direction_normal_component,
     orient_sparse_direction_axes,
 )
+from lib.silhouette_guard import STATUS_HARD, STATUS_OK, SilhouetteGuard
 
 
 def _write_head_sphere(path):
@@ -40,6 +42,38 @@ class MultiviewSegVisibilityTest(unittest.TestCase):
             head_mesh_path=str(self.head_path),
             visibility_tolerance=0.0,
         )
+
+    def build_stub_silhouette_guard(self, primary_authoritative):
+        guard = SilhouetteGuard.__new__(SilhouetteGuard)
+        guard.hard_px = 20.0
+        guard.views = ["front", "left"]
+        guard.primary = "front"
+        guard.side_views = ["left"]
+        guard.primary_authoritative = primary_authoritative
+        guard._project_px = lambda view, points: (
+            np.zeros(len(points), dtype=np.float32),
+            np.zeros(len(points), dtype=np.float32),
+        )
+        guard._sample_sd = lambda view, px, py: (
+            np.full(
+                len(px),
+                -30.0 if view == "front" else 5.0,
+                dtype=np.float32,
+            ),
+            np.ones(len(px), dtype=bool),
+        )
+        guard._visible = lambda view, points: np.ones(len(points), dtype=bool)
+        return guard
+
+    def test_primary_silhouette_mode_keeps_front_veto(self):
+        guard = self.build_stub_silhouette_guard(primary_authoritative=True)
+        status = guard.classify(np.zeros((1, 3), dtype=np.float32))
+        self.assertEqual(status.tolist(), [STATUS_HARD])
+
+    def test_union_silhouette_mode_accepts_visible_side_support(self):
+        guard = self.build_stub_silhouette_guard(primary_authoritative=False)
+        status = guard.classify(np.zeros((1, 3), dtype=np.float32))
+        self.assertEqual(status.tolist(), [STATUS_OK])
 
     def test_head_occlusion_abstains_and_visible_seg_supports(self):
         mask = np.zeros((9, 9), dtype=bool)
@@ -123,6 +157,40 @@ class MultiviewSegVisibilityTest(unittest.TestCase):
         aligned = align_vector_sign(vectors, reference)
 
         self.assertTrue(torch.all(torch.sum(aligned * reference, dim=0) >= 0.0))
+
+    def test_mesh_root_guidance_prefers_authoritative_seg(self):
+        roots = np.array([[0.0, 0.0, 0.3]], dtype=np.float32)
+        strand = np.ones((9, 9, 3), dtype=np.float32)
+        seg = np.zeros((9, 9), dtype=bool)
+        guidance = build_mesh_root_guidance(
+            self.head_path,
+            roots,
+            {"front": (self.calib, np.eye(3, dtype=np.float32))},
+            {"front": strand},
+            seg_masks={"front": seg},
+        )
+
+        self.assertFalse(guidance["visible_roots"]["front"].any())
+
+    def test_projection_mesh_support_does_not_require_visible_nearest_root(self):
+        # Mesh support and root launch visibility are separate concepts: a
+        # visible hair tip may be nearest to a scalp root hidden by the head.
+        # This invariant is exercised by keeping seg as the root gate above;
+        # projection rendering must not mutate or further shrink that gate.
+        roots = np.array([[0.0, 0.0, -0.3]], dtype=np.float32)
+        strand = np.ones((9, 9, 3), dtype=np.float32)
+        seg = np.ones((9, 9), dtype=bool)
+        guidance = build_mesh_root_guidance(
+            self.head_path,
+            roots,
+            {"front": (self.calib, np.eye(3, dtype=np.float32))},
+            {"front": strand},
+            seg_masks={"front": seg},
+            head_mesh_path=str(self.head_path),
+        )
+
+        self.assertFalse(guidance["visible_roots"]["front"][0])
+        self.assertGreater(len(guidance["vertices"]), 0)
 
     def test_sparse_direction_axes_propagate_consistent_sign(self):
         shape = (12, 12, 12)

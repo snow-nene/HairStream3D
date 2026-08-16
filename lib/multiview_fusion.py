@@ -16,9 +16,47 @@ Algorithm:
     - Else, weighted blend of left/right/back directions.
     - Unseen voxels → left as zeros (PDE fills them via Laplace interpolation).
 """
+import cv2
 import numpy as np
 import torch
 from scipy.ndimage import gaussian_filter
+
+
+def apply_image_similarity_to_calib(
+    calib,
+    angle_degrees,
+    scale,
+    translate_x_px,
+    translate_y_px,
+    image_size,
+):
+    """Compose an image-space similarity transform with a 4x4 projection."""
+    width, height = image_size
+    pixel_affine = cv2.getRotationMatrix2D(
+        (width / 2.0, height / 2.0),
+        float(angle_degrees),
+        float(scale),
+    )
+    pixel_affine[:, 2] += [float(translate_x_px), float(translate_y_px)]
+    pixel_h = np.eye(3, dtype=np.float64)
+    pixel_h[:2] = pixel_affine
+    ndc_to_pixel = np.array(
+        [
+            [(width - 1) / 2.0, 0.0, (width - 1) / 2.0],
+            [0.0, (height - 1) / 2.0, (height - 1) / 2.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    ndc_similarity = np.linalg.inv(ndc_to_pixel) @ pixel_h @ ndc_to_pixel
+    transform = np.eye(4, dtype=np.float64)
+    transform[0, 0] = ndc_similarity[0, 0]
+    transform[0, 1] = ndc_similarity[0, 1]
+    transform[0, 3] = ndc_similarity[0, 2]
+    transform[1, 0] = ndc_similarity[1, 0]
+    transform[1, 1] = ndc_similarity[1, 1]
+    transform[1, 3] = ndc_similarity[1, 2]
+    return (transform @ np.asarray(calib, dtype=np.float64)).astype(np.float32)
 
 
 def align_vector_sign(vectors, reference):
@@ -480,7 +518,8 @@ def compute_root_head_visibility(
 
 
 def build_mesh_root_guidance(
-    mesh_path, roots_world, calibs, strand_maps, head_mesh_path=None
+    mesh_path, roots_world, calibs, strand_maps, seg_masks=None,
+    head_mesh_path=None,
 ):
     """Build mesh→root labels and per-view root visibility gates."""
     import open3d as o3d
@@ -500,6 +539,7 @@ def build_mesh_root_guidance(
 
     root_homogeneous = np.column_stack([roots, np.ones(len(roots), dtype=np.float32)])
     visible_roots = {}
+    seg_masks = seg_masks or {}
     for view, strand_map in strand_maps.items():
         if view not in calibs:
             continue
@@ -512,7 +552,10 @@ def build_mesh_root_guidance(
         inside = (px >= 0) & (px < width) & (py >= 0) & (py < height)
         visible = np.zeros(len(roots), dtype=bool)
         indices = np.where(inside)[0]
-        visible[indices] = strand_map[py[indices], px[indices], 0] > 0.1
+        hair_mask = seg_masks.get(view)
+        if hair_mask is None:
+            hair_mask = strand_map[:, :, 0] > 0.1
+        visible[indices] = hair_mask[py[indices], px[indices]]
         if head_mesh_path is not None:
             visible &= compute_root_head_visibility(
                 head_mesh_path, roots, calib
@@ -531,9 +574,10 @@ def build_mesh_root_guidance(
 
 
 def save_mesh_root_projections(
-    guidance, calibs, strand_maps, background_paths, output_dir
+    guidance, calibs, strand_maps, background_paths, output_dir,
+    seg_masks=None,
 ):
-    """Save per-view visible mesh regions colored by their assigned roots."""
+    """Save hair-supported visible mesh regions colored by assigned roots."""
     import os
     import cv2
 
@@ -551,6 +595,7 @@ def save_mesh_root_projections(
     root_rgb = np.clip((roots - root_min) / root_span * 255.0, 0, 255).astype(np.uint8)
     root_bgr = root_rgb[:, ::-1]
 
+    seg_masks = seg_masks or {}
     for view, strand_map in strand_maps.items():
         if view not in calibs or view not in guidance["visible_roots"]:
             continue
@@ -576,6 +621,15 @@ def save_mesh_root_projections(
         np.maximum.at(zbuffer, flat, depth)
         visible = depth >= zbuffer[flat] - 0.003
         visible_ids = inside_ids[visible]
+
+        # The Pixal3D mesh may still contain face, neck, or disconnected
+        # fragments.  This diagnostic is intended to show only geometry that
+        # can actually support hair reconstruction in the current view.
+        hair_mask = seg_masks.get(view)
+        if hair_mask is None:
+            hair_mask = strand_map[:, :, 0] > 0.1
+        vertex_hair_supported = hair_mask[py[visible_ids], px[visible_ids]]
+        visible_ids = visible_ids[vertex_hair_supported]
 
         layer = np.zeros_like(background)
         mesh_mask = np.zeros((height, width), dtype=np.uint8)
@@ -605,7 +659,8 @@ def save_mesh_root_projections(
         overlay[root_py[root_inside], root_px[root_inside]] = (255, 255, 255)
         cv2.putText(
             overlay,
-            f"{view}: visible roots {root_inside.sum()}/{len(roots)}",
+            f"{view}: hair mesh {len(visible_ids)}, "
+            f"visible roots {root_inside.sum()}/{len(roots)}",
             (12, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2,
         )
         cv2.imwrite(os.path.join(output_dir, f"{view}.png"), overlay)
@@ -1182,20 +1237,18 @@ def fuse_multiview_orientation(
             distances, vertex_ids = mesh_root_guidance["vertex_tree"].query(
                 query_points, k=1, workers=-1
             )
-            root_ids = mesh_root_guidance["vertex_root_ids"][vertex_ids]
-            root_visible = mesh_root_guidance["visible_roots"][v][root_ids]
             near_mesh = distances <= max(2.5 * voxel_size, 0.004)
             normals = mesh_root_guidance["normals"][vertex_ids]
             candidate_dirs, tangent_stable = backproject_direction_on_mesh(
                 dx_v[idx_candidates], dy_v[idx_candidates], normals, R_pure
             )
-            accepted = near_mesh & root_visible & tangent_stable
+            accepted = near_mesh & tangent_stable
             idx_fill = idx_candidates[accepted]
             dir_3d_v = np.zeros((len(px), 3), dtype=np.float32)
             dir_3d_v[idx_fill] = candidate_dirs[accepted]
             print(
                 f"  {v} mesh/root gate: {len(idx_fill)}/{len(idx_candidates)} accepted "
-                f"(mesh={near_mesh.sum()}, roots={root_visible.sum()}, tangent={tangent_stable.sum()})"
+                f"(mesh={near_mesh.sum()}, tangent={tangent_stable.sum()})"
             )
         else:
             dz_dx_v, dz_dy_v = compute_depth_gradient(depth_maps[v], px, py)

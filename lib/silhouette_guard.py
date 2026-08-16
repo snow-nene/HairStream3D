@@ -45,6 +45,7 @@ class SilhouetteGuard:
         hard_px=20.0,
         surface_tolerance=0.01,
         primary_view="front",
+        primary_authoritative=True,
     ):
         """
         Args:
@@ -56,6 +57,8 @@ class SilhouetteGuard:
                 SOFT grace 流程，由调用方按连续越界步数裁决。
             surface_tolerance: 遮挡测试的表面容差（米）。
             primary_view: 权威视角（front）。其可见点只由它的 seg 判定。
+            primary_authoritative: 为 True 时保持原有的正面一票否决逻辑；
+                为 False 时，任一可见视角的 seg 确认即可放行。
         """
         import open3d as o3d
         from scipy.ndimage import distance_transform_edt
@@ -66,6 +69,7 @@ class SilhouetteGuard:
         if not self.views:
             raise ValueError("SilhouetteGuard 需要至少一个有 calib 的视角")
         self.primary = primary_view if primary_view in self.views else self.views[0]
+        self.primary_authoritative = bool(primary_authoritative)
         self.side_views = [v for v in self.views if v != self.primary]
 
         self.calibs = {}
@@ -194,16 +198,37 @@ class SilhouetteGuard:
         local_hard = np.zeros(len(idx), dtype=bool)
         local_soft = np.zeros(len(idx), dtype=bool)
 
-        # 主视角可见：由主视角 seg 单独裁决（front 是权威轮廓包络）
-        far_out = (~in_sub) | ~np.isfinite(sd_sub) | (sd_sub <= -hp)
-        near_out = in_sub & np.isfinite(sd_sub) & (sd_sub < 0.0) & (sd_sub > -hp)
-        local_hard[vis] = far_out[vis]
-        local_soft[vis] = near_out[vis]
+        if self.primary_authoritative:
+            # 主视角可见：由主视角 seg 单独裁决（front 是权威轮廓包络）
+            far_out = (~in_sub) | ~np.isfinite(sd_sub) | (sd_sub <= -hp)
+            near_out = in_sub & np.isfinite(sd_sub) & (sd_sub < 0.0) & (sd_sub > -hp)
+            local_hard[vis] = far_out[vis]
+            local_soft[vis] = near_out[vis]
 
-        # 主视角被头模遮挡：交给 side/back seg（任一可见视角确认即通过）
-        occluded = ~vis
-        if occluded.any() and self.side_views:
-            rest_pts = sub[occluded]
+            # 主视角被头模遮挡：交给 side/back seg（任一可见视角确认即通过）
+            occluded = ~vis
+            if occluded.any() and self.side_views:
+                rest_pts = sub[occluded]
+                side_ok = np.zeros(len(rest_pts), dtype=bool)
+                side_near = np.zeros(len(rest_pts), dtype=bool)
+                side_seen = np.zeros(len(rest_pts), dtype=bool)
+                for view in self.side_views:
+                    vpx, vpy = self._project_px(view, rest_pts)
+                    vsd, v_in = self._sample_sd(view, vpx, vpy)
+                    v_vis = v_in & np.isfinite(vsd) & self._visible(view, rest_pts)
+                    side_seen |= v_vis
+                    side_ok |= v_vis & (vsd >= 0.0)
+                    side_near |= v_vis & (vsd > -hp)
+                local_hard[occluded] = side_seen & ~side_near
+                local_soft[occluded] = side_seen & side_near & ~side_ok
+                # 没有任何视角可见的点：不约束（保持 OK）
+        else:
+            # 多视角联合模式：正面越界时允许任一侧/背视角的可见 seg
+            # 提供支持。只有所有可见视角都越过 hard_px 才立即停止。
+            any_seen = vis.copy()
+            any_ok = vis & in_sub & np.isfinite(sd_sub) & (sd_sub >= 0.0)
+            any_near = vis & in_sub & np.isfinite(sd_sub) & (sd_sub > -hp)
+            rest_pts = sub
             side_ok = np.zeros(len(rest_pts), dtype=bool)
             side_near = np.zeros(len(rest_pts), dtype=bool)
             side_seen = np.zeros(len(rest_pts), dtype=bool)
@@ -214,8 +239,11 @@ class SilhouetteGuard:
                 side_seen |= v_vis
                 side_ok |= v_vis & (vsd >= 0.0)
                 side_near |= v_vis & (vsd > -hp)
-            local_hard[occluded] = side_seen & ~side_near
-            local_soft[occluded] = side_seen & side_near & ~side_ok
+            any_seen |= side_seen
+            any_ok |= side_ok
+            any_near |= side_near
+            local_hard = any_seen & ~any_near
+            local_soft = any_seen & any_near & ~any_ok
             # 没有任何视角可见的点：不约束（保持 OK）
 
         status[idx[local_hard]] = STATUS_HARD
@@ -227,5 +255,7 @@ class SilhouetteGuard:
         widths = [self.masks[v].shape[1] for v in self.views]
         return (
             f"SilhouetteGuard(views={self.views}, primary={self.primary}, "
-            f"hard_px={self.hard_px}, image={widths[0]}x{heights[0]})"
+            f"hard_px={self.hard_px}, "
+            f"mode={'primary' if self.primary_authoritative else 'union'}, "
+            f"image={widths[0]}x{heights[0]})"
         )

@@ -37,6 +37,12 @@ class MultiViewLaplacePDEStrategy(LaplacePDEStrategy):
         self.max_normal_component = float(
             getattr(opt, "pde_max_normal_component", 0.3)
         )
+        self.harmonic_relax_iters = int(
+            getattr(opt, "pde_harmonic_relax_iters", 8)
+        )
+        self.scalp_boundary_width = float(
+            getattr(opt, "pde_scalp_boundary_width", 0.005)
+        )
         self._is_multiview = False
 
     def set_fused_data(self, orien_vol: np.ndarray, boundary_mask: np.ndarray,
@@ -163,6 +169,8 @@ class MultiViewLaplacePDEStrategy(LaplacePDEStrategy):
                 is_hair = binary_dilation(is_hair, structure=struct)
 
         scalp_boundary, scalp_normals = self._build_scalp_boundary(is_hair)
+        scalp_overlap = scalp_boundary & is_all_boundary
+        scalp_boundary &= ~is_all_boundary
         _, nearest_fused = distance_transform_edt(
             ~is_all_boundary, return_indices=True
         )
@@ -183,10 +191,10 @@ class MultiViewLaplacePDEStrategy(LaplacePDEStrategy):
         all_boundary = is_all_boundary | scalp_boundary
         boundary_orien = fused_orien.copy()
         boundary_orien[:, scalp_boundary] = scalp_orien[:, scalp_boundary]
-
         print(
             f'  Dir BC: fused={is_all_boundary.sum()}, '
-            f'scalp={scalp_boundary.sum()}, Hair domain={is_hair.sum()}'
+            f'scalp={scalp_boundary.sum()}, protected_fused={scalp_overlap.sum()}, '
+            f'Hair domain={is_hair.sum()}'
         )
 
         # Initialize from the nearest contribution of any view. Directions are
@@ -204,10 +212,10 @@ class MultiViewLaplacePDEStrategy(LaplacePDEStrategy):
                 c, idx_hair[0], idx_hair[1], idx_hair[2]
             ]
 
-        # Harmonic relaxation spreads all views symmetrically while clamping
-        # every fused surface contribution as a Dirichlet boundary.
+        # Match the scalp_protected_5mm baseline: every observed surface
+        # direction and the artificial scalp shell are hard Dirichlet data.
         print(f' {time.time()-t0:.1f}s, harmonic relax...', end=' ', flush=True)
-        for _ in range(8):
+        for _ in range(self.harmonic_relax_iters):
             smoothed = np.empty_like(orien_vol)
             for c in range(3):
                 smoothed[c] = gaussian_filter(orien_vol[c], sigma=1.0)
@@ -312,7 +320,7 @@ class MultiViewLaplacePDEStrategy(LaplacePDEStrategy):
         voxel_size = np.linalg.norm((b_max - b_min) / np.maximum(shape - 1.0, 1.0))
         near_scalp = (
             (signed_distance >= -voxel_size)
-            & (signed_distance <= 0.020)
+            & (signed_distance <= self.scalp_boundary_width)
         )
         if not near_scalp.any():
             return scalp_mask, scalp_orien

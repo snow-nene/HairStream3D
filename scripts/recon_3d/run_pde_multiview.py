@@ -104,6 +104,8 @@ def hair_synthesis_rk4(
     fallback_steps=12,
     silhouette_guard=None,
     silhouette_grace_steps=3,
+    max_turn_degrees=0.0,
+    actual_displacement_feedback=False,
     label="",
 ):
     """Trace strands with RK4 integration and continuous collision response.
@@ -131,6 +133,14 @@ def hair_synthesis_rk4(
     need_fallback = torch.zeros(num_strands, dtype=torch.bool, device=cuda)
     dead_total = 0
 
+    def normalize_nonzero(vectors):
+        norms = torch.norm(vectors, dim=0, keepdim=True)
+        return torch.where(
+            norms > 1e-8,
+            vectors / torch.clamp(norms, min=1e-8),
+            vectors,
+        )
+
     def query_direction(points, fallback_mask):
         direction = strategy.query(points, calib_tensor).squeeze(0)
         low = torch.norm(direction, dim=0) < 0.05
@@ -141,6 +151,7 @@ def hair_synthesis_rk4(
         return direction
 
     for index in range(1, num_sample):
+        step_origin = current
         fallback_mask = (index <= int(fallback_steps)) | need_fallback
         k1 = query_direction(current.unsqueeze(0), fallback_mask)
         if previous_direction is not None:
@@ -185,7 +196,32 @@ def hair_synthesis_rk4(
                 direction
                 + noise_weight.unsqueeze(0) * noise * magnitude
             )
-        previous_direction = direction
+        if previous_direction is not None and max_turn_degrees > 0.0:
+            previous_unit = normalize_nonzero(previous_direction)
+            direction_norm = torch.norm(direction, dim=0, keepdim=True)
+            direction_unit = normalize_nonzero(direction)
+            cosine = torch.clamp(
+                torch.sum(previous_unit * direction_unit, dim=0),
+                -1.0,
+                1.0,
+            )
+            angle = torch.acos(cosine)
+            max_angle = torch.deg2rad(
+                torch.tensor(max_turn_degrees, device=cuda)
+            )
+            blend = torch.clamp(max_angle / torch.clamp(angle, min=1e-6), max=1.0)
+            limited_unit = normalize_nonzero(
+                torch.lerp(previous_unit, direction_unit, blend.unsqueeze(0))
+            )
+            limited = angle > max_angle
+            direction = torch.where(
+                limited.unsqueeze(0),
+                limited_unit * direction_norm,
+                direction,
+            )
+
+        if not actual_displacement_feedback:
+            previous_direction = direction
 
         current = current + hair_unit * direction
 
@@ -263,6 +299,20 @@ def hair_synthesis_rk4(
                     f"stopped so far={dead_total}"
                 )
 
+        # Dead strands must remain at their last valid point. Without this
+        # unconditional mask, later clumping/collision updates can move a strand
+        # again after the silhouette or domain guard has stopped it.
+        current = torch.where(
+            alive.unsqueeze(0), current, hair_strands[index - 1]
+        )
+
+        if actual_displacement_feedback:
+            actual_direction = (current - step_origin) / max(hair_unit, 1e-8)
+            actual_valid = torch.norm(actual_direction, dim=0) > 1e-8
+            previous_direction = torch.where(
+                actual_valid.unsqueeze(0), actual_direction, direction
+            )
+
         hair_strands[index] = current
 
     if silhouette_guard is not None:
@@ -272,6 +322,30 @@ def hair_synthesis_rk4(
         )
 
     return hair_strands.permute(2, 0, 1).cpu().detach().numpy()
+
+
+def smooth_strands_laplacian(strands, iterations=0, strength=0.5):
+    """Smooth moving strand interiors while preserving roots and endpoints."""
+    if iterations <= 0 or strength <= 0.0:
+        return strands
+
+    smoothed = np.asarray(strands, dtype=np.float32).copy()
+    segment_lengths = np.linalg.norm(
+        smoothed[:, 1:] - smoothed[:, :-1], axis=2
+    )
+    effective_points = 1 + (segment_lengths > 1e-7).sum(axis=1)
+    sample_ids = np.arange(1, smoothed.shape[1] - 1)[None, :]
+    movable = sample_ids < (effective_points - 1)[:, None]
+    weight = float(np.clip(strength, 0.0, 1.0))
+
+    for _ in range(int(iterations)):
+        midpoint = 0.5 * (smoothed[:, :-2] + smoothed[:, 2:])
+        updated = (1.0 - weight) * smoothed[:, 1:-1] + weight * midpoint
+        smoothed[:, 1:-1] = np.where(
+            movable[:, :, None], updated, smoothed[:, 1:-1]
+        )
+
+    return smoothed
 
 
 def load_blender_view_calibration(data_dir, view):
@@ -360,6 +434,23 @@ def load_blender_view_calibration(data_dir, view):
     return calib.astype(np.float32), rotation.astype(np.float32)
 
 
+def resolve_front_calibration_paths(
+    data_dir,
+    front_calib_override=None,
+    front_depth_calib_override=None,
+):
+    """选择 front 姿态标定，并为稠密标定保留旧神经深度投影行。"""
+    param_dir = os.path.join(data_dir, "maps", "param")
+    legacy_path = os.path.join(param_dir, "front.npy")
+    dense_path = os.path.join(param_dir, "front_dense_silhouette.npy")
+    if front_calib_override:
+        return front_calib_override, front_depth_calib_override
+    if os.path.exists(dense_path):
+        depth_path = front_depth_calib_override or legacy_path
+        return dense_path, depth_path
+    return legacy_path, front_depth_calib_override
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Multi-View 3D Hair PDE Synthesis"
@@ -373,13 +464,26 @@ def main():
     parser.add_argument("--mesh_obj",
                         default=None,
                         help="Mesh object to use for bounds (default fallback)")
+    parser.add_argument(
+        "--front_calib",
+        default=None,
+        help="Optional front calibration override; defaults to maps/param/front.npy",
+    )
+    parser.add_argument(
+        "--front_depth_calib",
+        default=None,
+        help=(
+            "Optional calibration whose third projection row supplies the "
+            "front neural-depth scale while --front_calib supplies x/y pose"
+        ),
+    )
     parser.add_argument("--out_dir",
                         default=None,
                         help="Output directory (default: results/multiview_data/<img_id>/pde_reconstruction)")
     parser.add_argument("--roots",
                         default="data/roots10k.obj")
-    parser.add_argument("--pde_resolution", type=int, default=256)
-    parser.add_argument("--pde_dilation_iters", type=int, default=6)
+    parser.add_argument("--pde_resolution", type=int, default=384)
+    parser.add_argument("--pde_dilation_iters", type=int, default=25)
     parser.add_argument(
         "--pde_band_width",
         type=float,
@@ -401,6 +505,18 @@ def main():
         default=0.30,
         help="Maximum absolute hair-mesh normal component in the multi-view field",
     )
+    parser.add_argument(
+        "--pde_harmonic_relax_iters",
+        type=int,
+        default=8,
+        help="Number of clamped Gaussian harmonic-relaxation iterations",
+    )
+    parser.add_argument(
+        "--pde_scalp_boundary_width",
+        type=float,
+        default=0.005,
+        help="Width in meters of the artificial scalp boundary (default: 0.005)",
+    )
     parser.add_argument("--pde_alpha_mix", type=float, default=3.0,
                         help="2nd-order Laplacian weight (higher = better CG convergence)")
     parser.add_argument("--pde_beta_mix", type=float, default=1.0,
@@ -416,6 +532,32 @@ def main():
         type=int,
         default=12,
         help="Early RK4 steps allowed to use nearest-valid PDE direction",
+    )
+    parser.add_argument(
+        "--rk4_max_turn_degrees",
+        type=float,
+        default=0.0,
+        help="Optional maximum direction turn per RK4 step; <=0 disables it",
+    )
+    parser.add_argument(
+        "--rk4_actual_displacement_feedback",
+        action="store_true",
+        help=(
+            "Use the post-clump/post-collision displacement as the previous "
+            "RK4 direction on the next step"
+        ),
+    )
+    parser.add_argument(
+        "--strand_smoothing_iters",
+        type=int,
+        default=0,
+        help="Laplacian smoothing passes applied before final collision/trim",
+    )
+    parser.add_argument(
+        "--strand_smoothing_strength",
+        type=float,
+        default=0.5,
+        help="Per-pass Laplacian smoothing strength in [0, 1]",
     )
     parser.add_argument(
         "--silhouette_hard_px",
@@ -443,6 +585,14 @@ def main():
         help="Disable the visibility-driven silhouette constraint (ablation)",
     )
     parser.add_argument(
+        "--silhouette_multiview_union",
+        action="store_true",
+        help=(
+            "Allow any visible view's hair seg to support a point instead of "
+            "letting the primary/front view veto it (ablation)"
+        ),
+    )
+    parser.add_argument(
         "--export-per-view",
         action="store_true",
         help=(
@@ -450,9 +600,24 @@ def main():
             "depth map under pde_reconstruction/per_view/<view>/"
         ),
     )
+    parser.add_argument(
+        "--device",
+        choices=("auto", "cuda", "cpu"),
+        default="auto",
+        help="PyTorch execution device; auto falls back to CPU when CUDA is unavailable",
+    )
     args = parser.parse_args()
 
-    cuda = torch.device("cuda:0")
+    if args.device == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("--device cuda was requested, but CUDA is unavailable")
+    device_name = (
+        "cuda:0"
+        if args.device == "cuda"
+        or (args.device == "auto" and torch.cuda.is_available())
+        else "cpu"
+    )
+    cuda = torch.device(device_name)
+    print(f"Execution device: {cuda}")
 
     data_dir = os.path.join("results", "multiview_data", args.img_id)
     strand_dir = os.path.join(data_dir, "maps", "strand_map")
@@ -493,6 +658,24 @@ def main():
     if len(valid_views) == 0:
         raise RuntimeError("No valid views found for PDE reconstruction.")
 
+    # `seg` is the authoritative hair mask. The strand-map mask channel can
+    # include face/background pixels and must not gate mesh/root guidance.
+    seg_masks = {}
+    for view in valid_views:
+        seg_path = os.path.join(data_dir, "maps", "seg", f"{view}.png")
+        if not os.path.exists(seg_path):
+            raise FileNotFoundError(f"Missing hair seg: {seg_path}")
+        seg = imageio.imread(seg_path)
+        if seg.ndim == 3:
+            seg = seg[:, :, 0]
+        if seg.shape != depth_maps[view].shape:
+            seg = cv2.resize(
+                seg.astype(np.uint8),
+                (depth_maps[view].shape[1], depth_maps[view].shape[0]),
+                interpolation=cv2.INTER_NEAREST,
+            )
+        seg_masks[view] = seg > 127
+
     # ================================================================
     #  2. Build camera calibration matrices
     # ================================================================
@@ -520,9 +703,15 @@ def main():
         mesh = None
     print(f"  Mesh: {len(verts) if mesh else 0} verts, extent={extent:.4f}")
 
-    # ALWAYS use real front calibration (front.npy) for the front view — MUST match strand_map & depth_map
+    # Prefer the render-to-photo dense SO(3) + hair-silhouette calibration when
+    # available. Its x/y rows align the Pixal3D geometry to the real photo, while
+    # the legacy front.npy depth row stays coupled to the neural depth map.
     from scripts.recon_3d.recon3D import load_calib
-    real_calib_path = os.path.join(data_dir, "maps", "param", "front.npy")
+    real_calib_path, front_depth_calib_path = resolve_front_calibration_paths(
+        data_dir,
+        front_calib_override=args.front_calib,
+        front_depth_calib_override=args.front_depth_calib,
+    )
     glb_calib_path = os.path.join(data_dir, "maps", "param", "glb_param.npy")
 
     if os.path.exists(real_calib_path):
@@ -598,19 +787,28 @@ def main():
         front_calib = load_calib(front_calib_path, loadSize=1024)
         if isinstance(front_calib, torch.Tensor):
             front_calib = front_calib.numpy()
+        if front_depth_calib_path:
+            depth_calib = load_calib(front_depth_calib_path, loadSize=1024)
+            if isinstance(depth_calib, torch.Tensor):
+                depth_calib = depth_calib.numpy()
+            front_calib[2] = depth_calib[2]
+            print(
+                "  Front depth row preserved from: "
+                f"{front_depth_calib_path}"
+            )
 
     real_center = param.get('center').flatten().astype(np.float32)
     R_real = param.get('R').astype(np.float32)
     R_real = R_real / (np.linalg.norm(R_real, axis=1, keepdims=True) + 1e-8)
     
-    calibs = {"front": (front_calib.astype(np.float32), R_real)}
+    geometry_calibs = {"front": (front_calib.astype(np.float32), R_real)}
     print(f"  Real center: {real_center}")
 
     # Side/back: use the exact cameras that produced blender_renders/<view>.png.
     for v in valid_views:
         if v == "front":
             continue
-        calibs[v] = load_blender_view_calibration(data_dir, v)
+        geometry_calibs[v] = load_blender_view_calibration(data_dir, v)
         print(f"  {v}: loaded Blender ground-truth camera")
 
     mesh_root_guidance = None
@@ -627,8 +825,9 @@ def main():
             mesh_root_guidance = build_mesh_root_guidance(
                 guidance_mesh_path,
                 roots_world,
-                calibs,
+                geometry_calibs,
                 strand_maps,
+                seg_masks=seg_masks,
                 head_mesh_path="data/head_model.obj",
             )
             guidance_output = {
@@ -651,10 +850,11 @@ def main():
                     background_paths["front"] = file.read().strip()
             save_mesh_root_projections(
                 mesh_root_guidance,
-                calibs,
+                geometry_calibs,
                 strand_maps,
                 background_paths,
                 os.path.join(out_dir, "mesh_root_projection"),
+                seg_masks=seg_masks,
             )
             print(f"  Mesh/root guidance: {guidance_mesh_path}")
         else:
@@ -688,7 +888,7 @@ def main():
     fused_orien, boundary_mask, view_ownership = fuse_multiview_orientation(
         strand_maps=strand_maps,
         depth_maps=depth_maps,
-        calibs=calibs,
+        calibs=geometry_calibs,
         resolution=args.pde_resolution,
         b_min=b_min,
         b_max=b_max,
@@ -711,22 +911,6 @@ def main():
             "Visible surface shell requires pixal3d/hair_mesh_aligned_best.obj "
             "or --mesh_obj"
         )
-    seg_masks = {}
-    for view in valid_views:
-        seg_path = os.path.join(data_dir, "maps", "seg", f"{view}.png")
-        if not os.path.exists(seg_path):
-            raise FileNotFoundError(f"Missing hair seg for surface shell: {seg_path}")
-        seg = imageio.imread(seg_path)
-        if seg.ndim == 3:
-            seg = seg[:, :, 0]
-        if seg.shape != depth_maps[view].shape:
-            seg = cv2.resize(
-                seg.astype(np.uint8),
-                (depth_maps[view].shape[1], depth_maps[view].shape[0]),
-                interpolation=cv2.INTER_NEAREST,
-            )
-        seg_masks[view] = seg > 127
-
     silhouette_guard = None
     if not args.disable_silhouette_guard:
         from lib.silhouette_guard import SilhouetteGuard
@@ -734,10 +918,11 @@ def main():
         primary_view = "front" if "front" in seg_masks else valid_views[0]
         silhouette_guard = SilhouetteGuard(
             seg_masks=seg_masks,
-            calibs=calibs,
+            calibs=geometry_calibs,
             head_mesh_path="data/head_model.obj",
             hard_px=args.silhouette_hard_px,
             primary_view=primary_view,
+            primary_authoritative=not args.silhouette_multiview_union,
         )
         print(
             f"  {silhouette_guard.summary()}: RK4 growth is silhouette-constrained "
@@ -748,7 +933,7 @@ def main():
 
     hair_volume, raw_surface_shell, shell_counts = build_visible_mesh_surface_shell(
         aligned_surface_path,
-        calibs,
+        geometry_calibs,
         seg_masks,
         b_min,
         b_max,
@@ -769,7 +954,7 @@ def main():
                 aligned_surface_path,
                 strand_maps[view],
                 seg_masks[view],
-                calibs[view],
+                geometry_calibs[view],
             )
         )
         contribution_records[view] = (
@@ -819,7 +1004,6 @@ def main():
     reference = directions[starts]
     flip = np.sum(fused_directions * reference, axis=1) < 0.0
     fused_directions[flip] *= -1.0
-
     fused_ownership = np.minimum.reduceat(contributing_views, starts)
     gravity_oriented_owners = [
         view_id for view_id, view in enumerate(valid_views)
@@ -852,7 +1036,7 @@ def main():
     # Match the single-view PDE's physical length control: use a metric band
     # around the hair mesh rather than a resolution-dependent voxel dilation.
     seg_support_volume = build_multiview_seg_support_volume(
-        calibs,
+        geometry_calibs,
         seg_masks,
         b_min,
         b_max,
@@ -912,7 +1096,7 @@ def main():
 
     data = {
         "hairstep": torch.from_numpy(hairstep).float(),
-        "calib": torch.from_numpy(calibs["front"][0]).float().clone(),
+        "calib": torch.from_numpy(geometry_calibs["front"][0]).float().clone(),
     }
 
     b_min_val = np.asarray(b_min, dtype=np.float32)
@@ -930,6 +1114,8 @@ def main():
     opt_pde.pde_cg_maxiter = args.pde_cg_maxiter
     opt_pde.pde_anisotropy = args.pde_anisotropy
     opt_pde.pde_max_normal_component = args.pde_max_normal_component
+    opt_pde.pde_harmonic_relax_iters = args.pde_harmonic_relax_iters
+    opt_pde.pde_scalp_boundary_width = args.pde_scalp_boundary_width
     opt_pde.pde_alpha_mix = args.pde_alpha_mix
     opt_pde.pde_beta_mix = args.pde_beta_mix
     opt_pde.b_min = b_min_val
@@ -1013,7 +1199,13 @@ def main():
         .to(cuda)
     )
     calib_tensor = (
-        torch.from_numpy(calibs["front"][0]).float().unsqueeze(0).to(cuda)
+        torch.from_numpy(geometry_calibs["front"][0]).float().unsqueeze(0).to(cuda)
+    )
+    root_calib_tensor = (
+        torch.from_numpy(geometry_calibs["front"][0])
+        .float()
+        .unsqueeze(0)
+        .to(cuda)
     )
 
     # Divergence map (from front strand_map, consistent with original PDE pipeline)
@@ -1056,7 +1248,10 @@ def main():
     roots_3d = root_tensor.squeeze(0)
     N_roots = roots_3d.shape[1]
     pts_homo = torch.cat([roots_3d, torch.ones(1, N_roots, device=cuda)], dim=0)
-    uv = torch.matmul(calib_tensor.squeeze(0), pts_homo)
+    # Root selection belongs to the head geometry, not to the hair-only image
+    # correction.  Moving this projection would slide scalp roots with the
+    # hairstyle and undo the separation between head pose and hair alignment.
+    uv = torch.matmul(root_calib_tensor.squeeze(0), pts_homo)
     uv = uv[:2, :] / (uv[3:4, :] + 1e-8)
     uv_px_float = (uv + 1.0) * 0.5 * 511
     root_inside = (
@@ -1067,7 +1262,7 @@ def main():
     front_visible_np = compute_root_head_visibility(
         "data/head_model.obj",
         roots_3d.T.detach().cpu().numpy(),
-        calibs["front"][0],
+        geometry_calibs["front"][0],
     )
     front_visible = torch.from_numpy(front_visible_np).to(cuda)
     root_hair_mask = torch.zeros(N_roots, dtype=torch.bool, device=cuda)
@@ -1117,6 +1312,8 @@ def main():
         b_min_t=b_min_t, b_max_t=b_max_t,
         silhouette_guard=silhouette_guard,
         silhouette_grace_steps=args.silhouette_grace_steps,
+        max_turn_degrees=args.rk4_max_turn_degrees,
+        actual_displacement_feedback=args.rk4_actual_displacement_feedback,
         label="guides",
     )
     guide_strands_t = (
@@ -1140,6 +1337,8 @@ def main():
         valid_cluster_mask=valid_cluster_mask,
         silhouette_guard=silhouette_guard,
         silhouette_grace_steps=args.silhouette_grace_steps,
+        max_turn_degrees=args.rk4_max_turn_degrees,
+        actual_displacement_feedback=args.rk4_actual_displacement_feedback,
         label="strands",
     )
 
@@ -1147,6 +1346,36 @@ def main():
     #  7. Save
     # ================================================================
     print(f"\nStep 7: Clipping & saving to {out_ply}...")
+    if args.strand_smoothing_iters > 0:
+        strands = smooth_strands_laplacian(
+            strands,
+            iterations=args.strand_smoothing_iters,
+            strength=args.strand_smoothing_strength,
+        )
+
+        # Smoothing can move scalp-adjacent points into the head. Re-apply the
+        # same continuous SDF correction used during RK4 before silhouette trim.
+        flat = torch.from_numpy(strands.reshape(-1, 3).T).float().to(cuda)
+        corrected = 0
+        for start in range(0, flat.shape[1], 200_000):
+            stop = min(start + 200_000, flat.shape[1])
+            points = flat[:, start:stop]
+            sdf = query_grid(sdf_vol, points, b_min_t, b_max_t)
+            normal = torch.nn.functional.normalize(
+                query_grid(normal_vol, points, b_min_t, b_max_t), dim=0
+            )
+            penetration = 0.005 - sdf
+            collision = penetration > 0.0
+            points = points + collision * penetration * normal
+            flat[:, start:stop] = points
+            corrected += int(collision.sum())
+        strands = flat.T.reshape(strands.shape).cpu().numpy()
+        print(
+            f"[Strand Smoothing] iterations={args.strand_smoothing_iters}, "
+            f"strength={args.strand_smoothing_strength:.2f}, "
+            f"collision-corrected points={corrected}"
+        )
+
     if silhouette_guard is not None:
         from lib.hair_util import trim_strands_by_silhouette
 
@@ -1171,7 +1400,7 @@ def main():
         )
         for view in valid_views:
             curves = trace_view_strands_3d(
-                strand_maps[view], depth_maps[view], calibs[view][0]
+                strand_maps[view], depth_maps[view], geometry_calibs[view][0]
             )
             view_out_dir = os.path.join(per_view_root, view)
             os.makedirs(view_out_dir, exist_ok=True)

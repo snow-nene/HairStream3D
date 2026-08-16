@@ -47,7 +47,11 @@ from scipy.ndimage import (
 )
 import taichi as ti
 
-ti.init(arch=ti.cuda, device_memory_GB=20)
+_TAICHI_ARCH = ti.cuda if torch.cuda.is_available() else ti.cpu
+if _TAICHI_ARCH == ti.cuda:
+    ti.init(arch=_TAICHI_ARCH, device_memory_GB=20)
+else:
+    ti.init(arch=_TAICHI_ARCH)
 
 from .base import BaseReconStrategy
 from lib.geometry import orthogonal
