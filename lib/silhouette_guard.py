@@ -46,6 +46,7 @@ class SilhouetteGuard:
         surface_tolerance=0.01,
         primary_view="front",
         primary_authoritative=True,
+        forbidden_masks=None,
     ):
         """
         Args:
@@ -71,6 +72,7 @@ class SilhouetteGuard:
         self.primary = primary_view if primary_view in self.views else self.views[0]
         self.primary_authoritative = bool(primary_authoritative)
         self.side_views = [v for v in self.views if v != self.primary]
+        self.forbidden_masks = {}
 
         self.calibs = {}
         self.masks = {}
@@ -86,6 +88,14 @@ class SilhouetteGuard:
             if mask.ndim == 3:
                 mask = mask[:, :, 0] > 0
             self.masks[view] = mask
+            if forbidden_masks is not None and view in forbidden_masks:
+                forbidden = np.asarray(forbidden_masks[view]) > 0
+                if forbidden.shape != mask.shape:
+                    raise ValueError(
+                        f"forbidden mask shape mismatch for view {view}: "
+                        f"{forbidden.shape} vs {mask.shape}"
+                    )
+                self.forbidden_masks[view] = forbidden
             inside = distance_transform_edt(mask)
             outside = distance_transform_edt(~mask)
             self.sd_fields[view] = (inside - outside).astype(np.float32)
@@ -184,7 +194,21 @@ class SilhouetteGuard:
         px, py = self._project_px(primary, points)
         sd, in_img = self._sample_sd(primary, px, py)
 
-        clearly_inside = in_img & np.isfinite(sd) & (sd >= 0.0)
+        # Internal negative regions (e.g. a front hair part) are hard
+        # constraints independent of head occlusion.  Otherwise a strand
+        # projected into the gap can be delegated to side/back views.
+        forbidden = np.zeros(num, dtype=bool)
+        forbidden_masks = getattr(self, "forbidden_masks", {})
+        if primary in forbidden_masks:
+            fmask = forbidden_masks[primary]
+            h, w = fmask.shape
+            ix = np.rint(px).astype(np.int64)
+            iy = np.rint(py).astype(np.int64)
+            inside = (ix >= 0) & (ix < w) & (iy >= 0) & (iy < h)
+            forbidden[inside] = fmask[iy[inside], ix[inside]]
+            status[forbidden] = STATUS_HARD
+
+        clearly_inside = in_img & np.isfinite(sd) & (sd >= 0.0) & ~forbidden
         need = ~clearly_inside
         if not need.any():
             return status
@@ -197,6 +221,7 @@ class SilhouetteGuard:
 
         local_hard = np.zeros(len(idx), dtype=bool)
         local_soft = np.zeros(len(idx), dtype=bool)
+        local_hard |= forbidden[idx]
 
         if self.primary_authoritative:
             # 主视角可见：由主视角 seg 单独裁决（front 是权威轮廓包络）

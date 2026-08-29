@@ -135,7 +135,15 @@ def read_ply_strands(ply_path):
     return strands
 
 
-def create_curves_from_strands(name, strands, bevel_depth=0.0018):
+def create_curves_from_strands(
+    name,
+    strands,
+    bevel_depth=0.0018,
+    root_taper_points=0,
+    tip_taper_points=0,
+    root_min_radius=0.08,
+    tip_min_radius=0.03,
+):
     """
     创建带三维管径粗细的 3D Hair Curve 对象，并对齐到场景头顶位置
     """
@@ -159,6 +167,24 @@ def create_curves_from_strands(name, strands, bevel_depth=0.0018):
         # 4D 齐次坐标 [x, y, z, w=1.0]
         strand_4d = np.hstack((strand_world, np.ones((strand_world.shape[0], 1)))).astype(np.float32)
         s.points.foreach_set("co", strand_4d.flatten())
+        radii = np.ones(len(strand_world), dtype=np.float32)
+        root_count = min(max(0, int(root_taper_points)), len(radii))
+        tip_count = min(max(0, int(tip_taper_points)), len(radii))
+        if root_count:
+            radii[:root_count] = np.minimum(
+                radii[:root_count],
+                np.linspace(
+                    float(root_min_radius), 1.0, root_count, dtype=np.float32
+                ),
+            )
+        if tip_count:
+            radii[-tip_count:] = np.minimum(
+                radii[-tip_count:],
+                np.linspace(
+                    1.0, float(tip_min_radius), tip_count, dtype=np.float32
+                ),
+            )
+        s.points.foreach_set("radius", radii)
 
     obj = bpy.data.objects.new(name, curve)
     bpy.context.collection.objects.link(obj)
@@ -177,6 +203,10 @@ def main():
     parser.add_argument("--template_blend", type=str, default="assets/render_template.blend", help="Path to template blend file")
     parser.add_argument("--output_path", type=str, default="results/rendered_previews/blender_render.png", help="Output PNG path")
     parser.add_argument("--bevel_depth", type=float, default=0.0003, help="Hair strand thickness bevel depth")
+    parser.add_argument("--root_taper_points", type=int, default=0)
+    parser.add_argument("--tip_taper_points", type=int, default=0)
+    parser.add_argument("--root_min_radius", type=float, default=0.08)
+    parser.add_argument("--tip_min_radius", type=float, default=0.03)
     parser.add_argument("--save_blend", type=str, default="results/rendered_previews/scene_with_hair.blend", help="Path to save the modified Blender .blend project file")
     args = parser.parse_args(argv)
 
@@ -188,7 +218,15 @@ def main():
     print(f"[Blender Script] Imported {len(strands)} strands")
 
     # 创建发丝曲线对象
-    hair_obj = create_curves_from_strands("reconstructed_hair", strands, bevel_depth=args.bevel_depth)
+    hair_obj = create_curves_from_strands(
+        "reconstructed_hair",
+        strands,
+        bevel_depth=args.bevel_depth,
+        root_taper_points=args.root_taper_points,
+        tip_taper_points=args.tip_taper_points,
+        root_min_radius=args.root_min_radius,
+        tip_min_radius=args.tip_min_radius,
+    )
 
     # 赋予/创建材质
     mat = bpy.data.materials.get("Hair")

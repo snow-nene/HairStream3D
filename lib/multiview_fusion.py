@@ -16,6 +16,8 @@ Algorithm:
     - Else, weighted blend of left/right/back directions.
     - Unseen voxels → left as zeros (PDE fills them via Laplace interpolation).
 """
+import os
+
 import cv2
 import numpy as np
 import torch
@@ -848,6 +850,146 @@ def extract_view_mesh_surface_contribution(
     return line_points, lines
 
 
+def build_visible_hair_proxy_mesh(
+    mesh_path,
+    calibs,
+    seg_masks,
+    output_path,
+    face_dilation_rings=1,
+):
+    """Extract mesh triangles first seen through the input hair masks.
+
+    Pixal3D's aligned OBJ contains the face, neck and bust as well as hair.
+    Using that complete surface as a PDE distance prior therefore pulls the
+    domain towards non-hair geometry.  This helper keeps only triangles hit by
+    a camera ray whose source pixel is labelled as hair, then grows the face
+    selection by a small topological ring to avoid pixel-sampling cracks.
+    """
+    import open3d as o3d
+
+    mesh = o3d.io.read_triangle_mesh(str(mesh_path))
+    if not mesh.has_vertices() or not mesh.has_triangles():
+        raise ValueError(f"Hair-proxy source mesh is empty: {mesh_path}")
+    triangles = np.asarray(mesh.triangles)
+    scene = o3d.t.geometry.RaycastingScene()
+    scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(mesh))
+    selected = np.zeros(len(triangles), dtype=bool)
+    per_view_counts = {}
+
+    for view, mask in seg_masks.items():
+        if view not in calibs:
+            continue
+        mask = np.asarray(mask, dtype=bool)
+        py, px = np.nonzero(mask)
+        if not len(px):
+            per_view_counts[view] = 0
+            continue
+        height, width = mask.shape
+        uv = np.column_stack([
+            px / max(width - 1, 1) * 2.0 - 1.0,
+            py / max(height - 1, 1) * 2.0 - 1.0,
+        ])
+        calib = calibs[view][0] if isinstance(calibs[view], tuple) else calibs[view]
+        inverse = np.linalg.inv(np.asarray(calib, dtype=np.float64))
+
+        def unproject(depth):
+            clip = np.column_stack([
+                uv,
+                np.full(len(uv), depth, dtype=np.float64),
+                np.ones(len(uv), dtype=np.float64),
+            ])
+            world_h = clip @ inverse.T
+            return world_h[:, :3] / world_h[:, 3:4]
+
+        near = unproject(1.5)
+        direction = unproject(-0.5) - near
+        direction /= np.linalg.norm(direction, axis=1, keepdims=True) + 1e-12
+        result = scene.cast_rays(
+            o3d.core.Tensor(
+                np.column_stack([near, direction]).astype(np.float32)
+            )
+        )
+        hit = result["t_hit"].numpy()
+        primitive_ids = result["primitive_ids"].numpy().astype(np.int64)
+        valid = np.isfinite(hit) & (primitive_ids >= 0) & (
+            primitive_ids < len(triangles)
+        )
+        view_faces = np.unique(primitive_ids[valid])
+        selected[view_faces] = True
+        per_view_counts[view] = int(len(view_faces))
+
+    direct_count = int(selected.sum())
+    for _ in range(max(0, int(face_dilation_rings))):
+        selected_vertices = np.zeros(len(mesh.vertices), dtype=bool)
+        selected_vertices[triangles[selected].ravel()] = True
+        selected |= selected_vertices[triangles].any(axis=1)
+
+    proxy = o3d.geometry.TriangleMesh(
+        vertices=o3d.utility.Vector3dVector(np.asarray(mesh.vertices).copy()),
+        triangles=o3d.utility.Vector3iVector(triangles[selected].copy()),
+    )
+    proxy.remove_unreferenced_vertices()
+    proxy.remove_degenerate_triangles()
+    proxy.remove_duplicated_triangles()
+    proxy.compute_vertex_normals()
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    if not o3d.io.write_triangle_mesh(str(output_path), proxy):
+        raise IOError(f"Failed to save visible hair proxy: {output_path}")
+    print(
+        "[MultiviewFusion] Visible hair proxy: "
+        f"direct_faces={direct_count}, expanded_faces={len(proxy.triangles)}, "
+        f"per_view={per_view_counts}, path={output_path}"
+    )
+    return proxy, per_view_counts
+
+
+def build_surface_attraction_volume(surface_shell, b_min, b_max, domain_mask=None):
+    """Return a world-space vector from every voxel to its nearest shell.
+
+    The vector is deliberately not normalized: RK4 can use its magnitude to
+    leave a dead zone around the observed hair surface and progressively pull
+    only trajectories that drift too far into unsupported depth.
+    """
+    from scipy.ndimage import distance_transform_edt
+
+    surface_shell = np.asarray(surface_shell, dtype=bool)
+    if surface_shell.ndim != 3 or not surface_shell.any():
+        raise ValueError("surface_shell must be a non-empty 3D mask")
+    if domain_mask is not None:
+        domain_mask = np.asarray(domain_mask, dtype=bool)
+        if domain_mask.shape != surface_shell.shape:
+            raise ValueError("domain_mask must match surface_shell shape")
+    nearest = distance_transform_edt(
+        ~surface_shell,
+        return_distances=False,
+        return_indices=True,
+    )
+    shape = np.asarray(surface_shell.shape, dtype=np.int64)
+    spacing = (
+        np.asarray(b_max, dtype=np.float32)
+        - np.asarray(b_min, dtype=np.float32)
+    ) / np.maximum(shape - 1, 1)
+    vectors = np.empty((3, *surface_shell.shape), dtype=np.float32)
+    for axis in range(3):
+        coordinate_shape = [1, 1, 1]
+        coordinate_shape[axis] = shape[axis]
+        coordinates = np.arange(shape[axis], dtype=np.float32).reshape(
+            coordinate_shape
+        )
+        vectors[axis] = (
+            nearest[axis].astype(np.float32) - coordinates
+        ) * spacing[axis]
+    if domain_mask is not None:
+        vectors[:, ~domain_mask] = 0.0
+    distances = np.linalg.norm(vectors, axis=0)
+    print(
+        "[MultiviewFusion] Surface attraction field: "
+        f"active={int((distances > 0).sum())}, "
+        f"max_distance={float(distances.max()):.4f}m"
+    )
+    return vectors
+
+
 def build_multiview_seg_support_volume(
     calibs,
     seg_masks,
@@ -858,6 +1000,9 @@ def build_multiview_seg_support_volume(
     head_mesh_path="data/head_model.obj",
     occluder_mesh_path=None,
     visibility_tolerance=None,
+    surface_front_tolerance=None,
+    surface_back_tolerance=None,
+    primary_authoritative=True,
 ):
     """Fuse per-view segmentations with head-aware visibility.
 
@@ -886,13 +1031,23 @@ def build_multiview_seg_support_volume(
     occlusion_scene.add_triangles(
         o3d.t.geometry.TriangleMesh.from_legacy(head_mesh)
     )
+    occluder_geometry_id = None
     if occluder_mesh_path is not None:
         occluder_mesh = o3d.io.read_triangle_mesh(str(occluder_mesh_path))
         if not occluder_mesh.has_vertices() or not occluder_mesh.has_triangles():
             raise ValueError(f"Occluder mesh is empty: {occluder_mesh_path}")
-        occlusion_scene.add_triangles(
+        occluder_geometry_id = occlusion_scene.add_triangles(
             o3d.t.geometry.TriangleMesh.from_legacy(occluder_mesh)
         )
+    use_surface_window = surface_front_tolerance is not None
+    if use_surface_window:
+        if occluder_geometry_id is None:
+            raise ValueError(
+                "surface tolerances require an occluder_mesh_path"
+            )
+        if surface_front_tolerance < 0.0 or surface_back_tolerance is None \
+                or surface_back_tolerance < 0.0:
+            raise ValueError("surface tolerances must be non-negative")
 
     view_visibility = {}
     for view, mask in seg_masks.items():
@@ -924,13 +1079,14 @@ def build_multiview_seg_support_volume(
             np.linalg.norm(ray_directions, axis=1, keepdims=True) + 1e-12
         )
         rays = np.column_stack([ray_origins, ray_directions]).astype(np.float32)
-        occluder_hits = occlusion_scene.cast_rays(
-            o3d.core.Tensor(rays)
-        )["t_hit"].numpy()
+        ray_hits = occlusion_scene.cast_rays(o3d.core.Tensor(rays))
+        occluder_hits = ray_hits["t_hit"].numpy()
+        geometry_ids = ray_hits["geometry_ids"].numpy()
         view_visibility[view] = (
             ray_origins.astype(np.float32).reshape(height, width, 3),
             ray_directions.astype(np.float32).reshape(height, width, 3),
             occluder_hits.reshape(height, width),
+            geometry_ids.reshape(height, width),
         )
 
     xs = np.linspace(b_min[0], b_max[0], resolution, dtype=np.float32)
@@ -970,7 +1126,7 @@ def build_multiview_seg_support_volume(
             if not len(ids):
                 continue
 
-            origins, directions, head_hits = view_visibility[view]
+            origins, directions, head_hits, geometry_ids = view_visibility[view]
             pixel_y, pixel_x = py[ids], px[ids]
             ray_origins = origins[pixel_y, pixel_x]
             ray_directions = directions[pixel_y, pixel_x]
@@ -990,7 +1146,25 @@ def build_multiview_seg_support_volume(
                 )
             )
             is_hair = np.asarray(mask[pixel_y, pixel_x], dtype=bool)
-            positive = visible & is_hair
+            if use_surface_window:
+                hit_is_hair_surface = (
+                    np.isfinite(head_distance)
+                    & (geometry_ids[pixel_y, pixel_x] == occluder_geometry_id)
+                )
+                surface_window = (
+                    hit_is_hair_surface
+                    & (
+                        voxel_distance
+                        >= head_distance - float(surface_front_tolerance)
+                    )
+                    & (
+                        voxel_distance
+                        <= head_distance + float(surface_back_tolerance)
+                    )
+                )
+                positive = surface_window & is_hair
+            else:
+                positive = visible & is_hair
             negative = visible & ~is_hair
             if view == "front":
                 front_positive[ids] |= positive
@@ -1004,7 +1178,10 @@ def build_multiview_seg_support_volume(
         # Side-view negatives are not authoritative because synthesized masks
         # and the aligned head/hair geometry differ by a few centimeters.
         side_consensus = side_positive_votes > 0
-        slab_support = front_positive | (~front_negative & side_consensus)
+        if primary_authoritative:
+            slab_support = front_positive | (~front_negative & side_consensus)
+        else:
+            slab_support = front_positive | side_consensus
         positive_count += int(
             (front_positive | (side_positive_votes > 0)).sum()
         )
@@ -1017,7 +1194,9 @@ def build_multiview_seg_support_volume(
     print(
         "[MultiviewFusion] Visibility-aware seg support: "
         f"positive={positive_count}, negative={negative_count}, "
-        f"accepted={int(support.sum())}"
+        f"accepted={int(support.sum())}, "
+        f"surface_window={use_surface_window}, "
+        f"primary_authoritative={primary_authoritative}"
     )
     return support
 

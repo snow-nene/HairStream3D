@@ -17,6 +17,10 @@ from scipy.ndimage import gaussian_filter, binary_dilation, binary_erosion
 import taichi as ti
 
 from .recon_strategy.laplace_pde import LaplacePDEStrategy
+from .recon_strategy.weighted_poisson import (
+    build_signed_domain_distance,
+    solve_weighted_screened_poisson,
+)
 from .multiview_fusion import limit_direction_normal_component
 
 
@@ -34,6 +38,10 @@ class MultiViewLaplacePDEStrategy(LaplacePDEStrategy):
         self._fused_boundary = None    # (R, R, R) bool boundary mask
         self._head_mesh_path = "data/head_model.obj"
         self._fallback_orien_vol = None
+        self._internal_interface_mask = None
+        self._internal_interface_normals = None
+        self._internal_interface_confidence = 0.0
+        self._internal_interface_length = 0.006
         self.max_normal_component = float(
             getattr(opt, "pde_max_normal_component", 0.3)
         )
@@ -43,12 +51,48 @@ class MultiViewLaplacePDEStrategy(LaplacePDEStrategy):
         self.scalp_boundary_width = float(
             getattr(opt, "pde_scalp_boundary_width", 0.005)
         )
+        self.solver_mode = str(
+            getattr(opt, "pde_solver_mode", "legacy_smooth")
+        )
+        if self.solver_mode not in {"legacy_smooth", "screened_poisson"}:
+            raise ValueError(f"Unknown multi-view PDE solver: {self.solver_mode}")
+        self.side_soft_confidence = float(
+            getattr(opt, "pde_side_soft_confidence", 0.10)
+        )
+        self.side_screening_length = float(
+            getattr(opt, "pde_side_screening_length", 0.02)
+        )
+        self.side_max_angle_degrees = float(
+            getattr(opt, "pde_side_max_angle_degrees", 60.0)
+        )
+        self.side_constraint_mode = str(
+            getattr(opt, "pde_side_constraint_mode", "soft")
+        )
+        if self.side_constraint_mode not in {"soft", "hard"}:
+            raise ValueError(
+                f"Unknown PDE side constraint mode: {self.side_constraint_mode}"
+            )
+        self.domain_tangent_confidence = float(
+            getattr(opt, "pde_domain_tangent_confidence", 0.0)
+        )
+        self.domain_tangent_length = float(
+            getattr(opt, "pde_domain_tangent_length", 0.01)
+        )
+        self.domain_padding_voxels = int(
+            getattr(opt, "pde_domain_padding_voxels", 0)
+        )
+        self.solver_metrics = None
+        self._pde_domain = None
         self._is_multiview = False
 
     def set_fused_data(self, orien_vol: np.ndarray, boundary_mask: np.ndarray,
                         hair_volume: np.ndarray = None,
                         view_ownership: np.ndarray = None,
-                        head_mesh_path: str = "data/head_model.obj"):
+                        head_mesh_path: str = "data/head_model.obj",
+                        internal_interface_mask: np.ndarray = None,
+                        internal_interface_normals: np.ndarray = None,
+                        internal_interface_confidence: float = 0.0,
+                        internal_interface_length: float = 0.006):
         R = self.resolution
         assert orien_vol.shape == (3, R, R, R)
         self._fused_orien_vol = orien_vol.copy()
@@ -56,6 +100,18 @@ class MultiViewLaplacePDEStrategy(LaplacePDEStrategy):
         self._fused_hair_volume = (hair_volume.copy() if hair_volume is not None else None)
         self._fused_view_owner = (view_ownership.copy() if view_ownership is not None else None)
         self._head_mesh_path = head_mesh_path
+        self._internal_interface_mask = (
+            internal_interface_mask.copy()
+            if internal_interface_mask is not None else None
+        )
+        self._internal_interface_normals = (
+            internal_interface_normals.copy()
+            if internal_interface_normals is not None else None
+        )
+        self._internal_interface_confidence = float(
+            internal_interface_confidence
+        )
+        self._internal_interface_length = float(internal_interface_length)
         self._is_multiview = True
 
     def filter(self, data: dict, mesh_path: str = None) -> None:
@@ -72,18 +128,294 @@ class MultiViewLaplacePDEStrategy(LaplacePDEStrategy):
             # Fallback to single-view parent behavior
             return super().filter(data, mesh_path=mesh_path)
 
-        print('[MultiViewPDE] Solving directly from fused mesh-surface boundary...')
-        self._orien_vol = self._solve_pde_on_fused_boundary(
-            self._fused_orien_vol,
-            self._fused_boundary,
-            mesh_path=mesh_path,
-        )
+        print(f'[MultiViewPDE] Solver mode: {self.solver_mode}')
+        if self.solver_mode == "screened_poisson":
+            self._orien_vol = self._solve_weighted_screened_poisson(
+                mesh_path=mesh_path
+            )
+        else:
+            print(
+                '[MultiViewPDE] legacy_smooth is EDT + Gaussian relaxation; '
+                'it is retained only as a non-PDE regression baseline.'
+            )
+            self._orien_vol = self._solve_pde_on_fused_boundary(
+                self._fused_orien_vol,
+                self._fused_boundary,
+                mesh_path=mesh_path,
+            )
         self._occ_vol = (
-            self._fused_hair_volume.astype(np.float32)
+            self._pde_domain.astype(np.float32)
+            if self._pde_domain is not None
+            else self._fused_hair_volume.astype(np.float32)
             if self._fused_hair_volume is not None
             else self._fused_boundary.astype(np.float32)
         )
         print('[MultiViewPDE] Field build complete.')
+
+    def _solve_weighted_screened_poisson(self, mesh_path: str = None) -> np.ndarray:
+        """Solve the true masked PDE with hard front and soft side evidence."""
+        from scipy.ndimage import distance_transform_edt, label
+
+        observed = np.asarray(self._fused_boundary, dtype=bool)
+        if not observed.any():
+            raise RuntimeError(
+                "Multi-view orientation requires a non-empty fused boundary"
+            )
+        domain = (
+            np.asarray(self._fused_hair_volume, dtype=bool) | observed
+            if self._fused_hair_volume is not None
+            else binary_dilation(observed, iterations=max(1, self.dilation_iters))
+        )
+        constraint_domain = domain.copy()
+        unpadded_domain_voxels = int(domain.sum())
+        if self.domain_padding_voxels > 0:
+            domain = binary_dilation(
+                domain,
+                structure=np.ones((3, 3, 3), dtype=bool),
+                iterations=self.domain_padding_voxels,
+            ) | observed
+        padding_added_voxels = int(domain.sum()) - unpadded_domain_voxels
+        owner = self._fused_view_owner
+        if owner is None:
+            front_boundary = observed.copy()
+            side_boundary = np.zeros_like(observed)
+        else:
+            front_boundary = observed & (owner == 0)
+            side_boundary = observed & (owner > 0)
+        if not front_boundary.any():
+            raise RuntimeError(
+                "screened_poisson requires a trusted front boundary"
+            )
+
+        # Padding extends only the PDE unknown region. Artificial scalp
+        # Dirichlet constraints must stay tied to the original hair volume,
+        # otherwise a padding ablation also changes the root boundary data.
+        scalp_boundary, scalp_normals = self._build_scalp_boundary(
+            constraint_domain
+        )
+        scalp_boundary &= ~observed
+        _, nearest_observed = distance_transform_edt(
+            ~observed, return_indices=True
+        )
+        scalp_values = np.zeros_like(self._fused_orien_vol)
+        if scalp_boundary.any():
+            nearest_scalp = nearest_observed[:, scalp_boundary]
+            nearest_directions = self._fused_orien_vol[
+                :,
+                nearest_scalp[0],
+                nearest_scalp[1],
+                nearest_scalp[2],
+            ]
+            blended = (
+                0.7 * nearest_directions
+                + 0.3 * scalp_normals[:, scalp_boundary]
+            )
+            blended /= np.linalg.norm(blended, axis=0, keepdims=True) + 1e-8
+            scalp_values[:, scalp_boundary] = blended
+
+        hard_boundary = front_boundary | scalp_boundary
+        hard_values = np.zeros_like(self._fused_orien_vol, dtype=np.float32)
+        hard_values[:, front_boundary] = self._fused_orien_vol[:, front_boundary]
+        hard_values[:, scalp_boundary] = scalp_values[:, scalp_boundary]
+
+        # A line field is signless. Align synthesized directions to the nearest
+        # trusted front/scalp direction before turning them into soft sources.
+        _, nearest_hard = distance_transform_edt(
+            ~hard_boundary, return_indices=True
+        )
+        soft_values = np.zeros_like(hard_values)
+        soft_weight = np.zeros_like(domain, dtype=np.float32)
+        accepted_side = np.zeros_like(domain, dtype=bool)
+        if side_boundary.any() and self.side_soft_confidence > 0.0:
+            nearest_side = nearest_hard[:, side_boundary]
+            reference = hard_values[
+                :,
+                nearest_side[0],
+                nearest_side[1],
+                nearest_side[2],
+            ]
+            side = self._fused_orien_vol[:, side_boundary].copy()
+            signed_dot = np.sum(side * reference, axis=0)
+            side[:, signed_dot < 0.0] *= -1.0
+            agreement = np.abs(np.sum(side * reference, axis=0))
+            accepted = agreement >= np.cos(
+                np.deg2rad(self.side_max_angle_degrees)
+            )
+            side_coordinates = np.flatnonzero(side_boundary)
+            accepted_ids = side_coordinates[accepted]
+            accepted_side.ravel()[accepted_ids] = True
+            soft_values.reshape(3, -1)[:, accepted_ids] = side[:, accepted]
+            screening = self.side_soft_confidence / max(
+                self.side_screening_length ** 2, 1e-8
+            )
+            soft_weight.ravel()[accepted_ids] = screening
+
+        side_hard = np.zeros_like(domain, dtype=bool)
+        if self.side_constraint_mode == "hard" and accepted_side.any():
+            side_hard = accepted_side.copy()
+            hard_boundary |= side_hard
+            hard_values[:, side_hard] = soft_values[:, side_hard]
+            soft_values[:, side_hard] = 0.0
+            soft_weight[side_hard] = 0.0
+
+        # Components with no hard or soft observation make the operator
+        # singular and cannot produce meaningful root-to-tip flow. Remove them
+        # explicitly and report the governance action.
+        components, component_count = label(domain)
+        anchors = hard_boundary | (soft_weight > 0.0)
+        anchored_ids = np.unique(components[anchors])
+        anchored_ids = anchored_ids[anchored_ids > 0]
+        kept_domain = np.isin(components, anchored_ids)
+        removed_voxels = int(domain.sum() - kept_domain.sum())
+        removed_components = int(component_count - len(anchored_ids))
+        domain = kept_domain | hard_boundary | accepted_side
+        self._pde_domain = domain
+
+        initial_sources = hard_boundary | accepted_side
+        initial_values = hard_values + soft_values
+        _, nearest_source = distance_transform_edt(
+            ~initial_sources, return_indices=True
+        )
+        initial = np.zeros_like(hard_values)
+        source_ids = nearest_source[:, domain]
+        initial[:, domain] = initial_values[
+            :, source_ids[0], source_ids[1], source_ids[2]
+        ]
+        spacing = (
+            np.asarray(self.b_max, dtype=np.float64)
+            - np.asarray(self.b_min, dtype=np.float64)
+        ) / np.maximum(np.asarray(domain.shape) - 1, 1)
+
+        tangent_normals = None
+        tangent_weight = None
+        tangent_boundary = np.zeros_like(domain, dtype=bool)
+        if self.domain_tangent_confidence > 0.0:
+            _, tangent_normals, _ = build_signed_domain_distance(
+                domain,
+                self.b_min,
+                self.b_max,
+            )
+            tangent_boundary = (
+                domain
+                & ~binary_erosion(domain, structure=np.ones((3, 3, 3), dtype=bool))
+                & ~hard_boundary
+            )
+            tangent_weight = np.zeros_like(domain, dtype=np.float32)
+            tangent_weight[tangent_boundary] = (
+                self.domain_tangent_confidence
+                / max(self.domain_tangent_length ** 2, 1e-8)
+            )
+
+        interface_boundary = np.zeros_like(domain, dtype=bool)
+        if (
+            self._internal_interface_mask is not None
+            and self._internal_interface_normals is not None
+            and self._internal_interface_confidence > 0.0
+        ):
+            interface_boundary = (
+                np.asarray(self._internal_interface_mask, dtype=bool)
+                & domain
+                & ~hard_boundary
+            )
+            interface_normals = np.asarray(
+                self._internal_interface_normals, dtype=np.float32
+            )
+            if interface_normals.shape != hard_values.shape:
+                raise ValueError(
+                    "internal_interface_normals must have shape (3, X, Y, Z)"
+                )
+            if tangent_normals is None:
+                tangent_normals = np.zeros_like(hard_values, dtype=np.float32)
+                tangent_weight = np.zeros_like(domain, dtype=np.float32)
+            tangent_normals[:, interface_boundary] = (
+                interface_normals[:, interface_boundary]
+            )
+            tangent_weight[interface_boundary] = (
+                self._internal_interface_confidence
+                / max(self._internal_interface_length ** 2, 1e-8)
+            )
+
+        print(
+            '  True PDE constraints: '
+            f'domain={int(domain.sum())}, front_dirichlet={int(front_boundary.sum())}, '
+            f'scalp_dirichlet={int(scalp_boundary.sum())}, '
+            f'side_{self.side_constraint_mode}='
+            f'{int(accepted_side.sum())}/{int(side_boundary.sum())}, '
+            f'domain_padding={self.domain_padding_voxels}vox/'
+            f'+{padding_added_voxels}vox, '
+            f'domain_tangent={int(tangent_boundary.sum())}, '
+            f'parting_interface={int(interface_boundary.sum())}, '
+            f'pruned_components={removed_components}, '
+            f'pruned_voxels={removed_voxels}'
+        )
+        solved, metrics = solve_weighted_screened_poisson(
+            domain,
+            hard_values,
+            hard_boundary,
+            soft_values=soft_values,
+            soft_weight=soft_weight,
+            normal_penalty_normals=tangent_normals,
+            normal_penalty_weight=tangent_weight,
+            spacing=spacing,
+            tolerance=self.cg_tol,
+            max_iterations=self.cg_maxiter,
+            initial_field=initial,
+            device=self.cuda,
+            dtype=torch.float32,
+            validate_components=True,
+        )
+        self.solver_metrics = metrics.to_dict()
+        self.solver_metrics.update({
+            "domain_tangent_voxels": int(tangent_boundary.sum()),
+            "domain_tangent_confidence": self.domain_tangent_confidence,
+            "domain_tangent_length": self.domain_tangent_length,
+            "parting_interface_voxels": int(interface_boundary.sum()),
+            "parting_interface_confidence": (
+                self._internal_interface_confidence
+            ),
+            "parting_interface_length": self._internal_interface_length,
+            "domain_padding_voxels": self.domain_padding_voxels,
+            "unpadded_domain_voxels": unpadded_domain_voxels,
+            "side_constraint_mode": self.side_constraint_mode,
+            "side_hard_voxels": int(side_hard.sum()),
+        })
+        print(
+            '  PDE solved: '
+            f'converged={metrics.converged}, iterations={metrics.iterations}, '
+            f'residual={metrics.initial_relative_residual:.3e}'
+            f'->{metrics.final_relative_residual:.3e}, '
+            f'time={metrics.elapsed_seconds:.2f}s'
+        )
+        if not metrics.converged:
+            raise RuntimeError(
+                "screened-Poisson did not converge: "
+                f"residual={metrics.final_relative_residual:.3e}, "
+                f"breakdown={metrics.breakdown}"
+            )
+
+        norms = np.linalg.norm(solved, axis=0, keepdims=True)
+        valid = domain & (norms[0] > 1e-6)
+        solved[:, valid] /= norms[:, valid]
+        solved[:, ~valid] = 0.0
+
+        if mesh_path and self.max_normal_component < 1.0:
+            self._limit_field_surface_normal(
+                solved,
+                valid,
+                mesh_path,
+            )
+
+        if valid.any():
+            _, nearest_valid = distance_transform_edt(
+                ~valid, return_indices=True
+            )
+            self._fallback_orien_vol = solved[
+                :,
+                nearest_valid[0],
+                nearest_valid[1],
+                nearest_valid[2],
+            ]
+        return solved
 
     def _apply_side_residual(self, front_field: np.ndarray) -> np.ndarray:
         """Apply a bounded local correction from side views to a front field.

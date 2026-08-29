@@ -10,6 +10,8 @@ from lib.multiview_fusion import (
     build_mesh_root_guidance,
     build_mesh_metric_band,
     build_multiview_seg_support_volume,
+    build_surface_attraction_volume,
+    build_visible_hair_proxy_mesh,
     limit_direction_normal_component,
     orient_sparse_direction_axes,
 )
@@ -313,6 +315,77 @@ class MultiviewSegVisibilityTest(unittest.TestCase):
         )
 
         self.assertTrue(support[5, 5, 5])
+
+    def test_visible_hair_proxy_keeps_only_mask_hit_faces(self):
+        source = o3d.geometry.TriangleMesh.create_box(
+            width=1.0, height=1.0, depth=0.2
+        )
+        source.translate((-0.5, -0.5, 0.1))
+        source_path = Path(self.temp_dir.name) / "full_surface.obj"
+        proxy_path = Path(self.temp_dir.name) / "hair_proxy.obj"
+        self.assertTrue(o3d.io.write_triangle_mesh(str(source_path), source))
+
+        proxy, counts = build_visible_hair_proxy_mesh(
+            source_path,
+            {"front": (self.calib, np.eye(3, dtype=np.float32))},
+            {"front": np.ones((9, 9), dtype=bool)},
+            proxy_path,
+            face_dilation_rings=0,
+        )
+
+        self.assertGreater(counts["front"], 0)
+        self.assertGreater(len(proxy.triangles), 0)
+        self.assertLess(len(proxy.triangles), len(source.triangles))
+        self.assertTrue(proxy_path.exists())
+
+    def test_asymmetric_surface_window_limits_front_and_back_depth(self):
+        distant_head = o3d.geometry.TriangleMesh.create_sphere(
+            radius=0.1, resolution=12
+        )
+        distant_head.translate((0.0, 5.0, 0.0))
+        head_path = Path(self.temp_dir.name) / "window_head.obj"
+        self.assertTrue(o3d.io.write_triangle_mesh(str(head_path), distant_head))
+        surface = o3d.geometry.TriangleMesh.create_box(
+            width=1.0, height=1.0, depth=0.02
+        )
+        surface.translate((-0.5, -0.5, 0.3))
+        surface_path = Path(self.temp_dir.name) / "window_surface.obj"
+        self.assertTrue(o3d.io.write_triangle_mesh(str(surface_path), surface))
+
+        support = build_multiview_seg_support_volume(
+            {"front": (self.calib, np.eye(3, dtype=np.float32))},
+            {"front": np.ones((9, 9), dtype=bool)},
+            self.b_min,
+            self.b_max,
+            resolution=11,
+            slab_size=3,
+            head_mesh_path=str(head_path),
+            occluder_mesh_path=str(surface_path),
+            visibility_tolerance=0.0,
+            surface_front_tolerance=0.05,
+            surface_back_tolerance=0.20,
+        )
+
+        self.assertTrue(support[5, 5, 8])
+        self.assertTrue(support[5, 5, 7])
+        self.assertFalse(support[5, 5, 9])
+        self.assertFalse(support[5, 5, 5])
+
+    def test_surface_attraction_vectors_point_to_nearest_shell(self):
+        shell = np.zeros((5, 5, 5), dtype=bool)
+        shell[2, 2, 2] = True
+        domain = np.ones_like(shell)
+        vectors = build_surface_attraction_volume(
+            shell,
+            np.zeros(3, dtype=np.float32),
+            np.ones(3, dtype=np.float32),
+            domain_mask=domain,
+        )
+
+        self.assertTrue(np.allclose(vectors[:, 2, 2, 2], 0.0))
+        self.assertGreater(vectors[0, 0, 2, 2], 0.0)
+        self.assertLess(vectors[0, 4, 2, 2], 0.0)
+        self.assertTrue(np.allclose(vectors[1:, 0, 2, 2], 0.0))
 
 
 if __name__ == "__main__":
