@@ -66,6 +66,29 @@ def fit(strands, surface, clearance=0.0005):
         # 输出前缀的填充点必须跟随末端，不能形成新发丝段。
         for i, size in enumerate(sizes):
             fitted[i, size:] = fitted[i, size - 1]
+    # Projection can stretch a segment across a curved surface. Subdivide the
+    # projected geometry, carrying the source correspondence for displacement
+    # reporting, then restore clearance on the newly inserted points.
+    for _ in range(3):
+        pieces, references = [], []
+        for strand, reference, size in zip(fitted, original, sizes):
+            p, q = strand[:size], reference[:size]
+            length = np.r_[0., np.cumsum(np.linalg.norm(np.diff(p, axis=0), axis=1))]
+            keep = np.r_[True, np.diff(length) > 1e-10]
+            length, p, q = length[keep], p[keep], q[keep]
+            t = np.unique(np.r_[length, np.linspace(0, length[-1],
+                          max(1, int(np.ceil(length[-1] / .00025))) + 1)])
+            pieces.append(np.column_stack([np.interp(t, length, p[:, k]) for k in range(3)]))
+            references.append(np.column_stack([np.interp(t, length, q[:, k]) for k in range(3)]))
+        sizes = np.array([len(p) for p in pieces])
+        fitted = np.empty((len(pieces), sizes.max(), 3), np.float32)
+        original = np.empty_like(fitted)
+        for i, (p, q) in enumerate(zip(pieces, references)):
+            fitted[i, :len(p)] = p
+            fitted[i, len(p):] = p[-1]
+            original[i, :len(q)] = q
+            original[i, len(q):] = q[-1]
+        fitted = project_with_clearance(fitted.reshape(-1, 3), surface, clearance).reshape(fitted.shape)
     return fitted, original, sizes
 
 
@@ -86,6 +109,8 @@ def main():
     after=measure(fitted,surface)
     # 独立加密采样验证整段管径余量，半径 0.3 mm，额外保留采样误差余量。
     independent = independent_collision_audit(fitted, mesh)
+    (args.output_dir/'collision_diagnostic.json').write_text(json.dumps(
+        {'before': before, 'after': after, 'independent': independent}, indent=2))
     if after['minimum_head_normal_distance_m']<.0004 or not independent['passed']:
         raise RuntimeError('template head collision gate failed; nothing exported')
     payload={k:source[k] for k in source.files if k not in ['strands','termination_step']}

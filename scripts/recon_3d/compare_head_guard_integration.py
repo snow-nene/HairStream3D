@@ -45,17 +45,25 @@ def independent_collision_audit(strands, mesh, sample_m=0.000125):
         raise ValueError("independent collision audit requires a watertight head mesh")
     scene = o3d.t.geometry.RaycastingScene()
     scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(mesh))
-    samples = []
+    if sample_m <= 0:
+        raise ValueError('sample spacing must be positive')
+    inside, total = 0, 0
     for strand in np.asarray(strands):
-        for start, end in zip(strand[:-1], strand[1:]):
+        # Repeated terminal padding has no geometric extent. Keep the first
+        # point so that a degenerate strand is still audited.
+        keep = np.r_[True, np.linalg.norm(np.diff(strand, axis=0), axis=1) > 0]
+        p = strand[keep]
+        samples = [p[:1]]
+        for start, end in zip(p[:-1], p[1:]):
             count = max(1, int(np.ceil(np.linalg.norm(end - start) / sample_m)))
             samples.append(start + np.linspace(0, 1, count + 1)[:, None] * (end - start))
-    if not samples:
-        samples = [np.asarray(strands).reshape(-1, 3)]
-    points = np.concatenate(samples, axis=0).astype(np.float32)
-    occupied = scene.compute_occupancy(o3d.core.Tensor(points)).numpy().astype(bool)
-    return {"passed": not bool(occupied.any()), "sampled_points": int(len(points)),
-            "inside_points": int(occupied.sum()), "sample_spacing_m": sample_m}
+        points = np.concatenate(samples, axis=0).astype(np.float32)
+        # Multiple rays avoid parity errors at shared triangle edges/vertices.
+        occupied = scene.compute_occupancy(o3d.core.Tensor(points), nsamples=11).numpy()
+        inside += int(occupied.sum())
+        total += len(points)
+    return {"passed": inside == 0, "sampled_points": total,
+            "inside_points": inside, "sample_spacing_m": sample_m, "occupancy_rays": 11}
 
 
 def correct_direction(points, vectors, surface, traveled, clearance, ramp, band):
