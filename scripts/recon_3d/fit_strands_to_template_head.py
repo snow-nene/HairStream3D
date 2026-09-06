@@ -10,7 +10,12 @@ import open3d as o3d
 from scipy.ndimage import gaussian_filter1d
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.recon_3d.compare_head_guard_integration import HeadSurface, measure
+from lib.template_identity import load_template_identity
+from scripts.recon_3d.compare_head_guard_integration import (
+    HeadSurface,
+    independent_collision_audit,
+    measure,
+)
 from scripts.recon_3d.recover_boundary_strands import export_all
 
 
@@ -72,20 +77,27 @@ def main():
     args.output_dir.mkdir(parents=True,exist_ok=False)
     source=np.load(args.input);h=np.load(args.head)
     mesh=o3d.geometry.TriangleMesh(o3d.utility.Vector3dVector(h['vertices']),o3d.utility.Vector3iVector(h['faces']))
+    if not mesh.is_watertight():
+        raise RuntimeError('evaluated Blender head must be watertight before export')
+    identity = load_template_identity(args.head)
     surface=HeadSurface(mesh);strands=source['strands']
     before=measure(strands,surface);print('before',before,flush=True)
     fitted,original,sizes=fit(strands,surface)
     after=measure(fitted,surface)
     # 独立加密采样验证整段管径余量，半径 0.3 mm，额外保留采样误差余量。
-    if after['minimum_head_normal_distance_m']<.0004:raise RuntimeError('管径安全间隙未通过，不导出')
+    independent = independent_collision_audit(fitted, mesh)
+    if after['minimum_head_normal_distance_m']<.0004 or not independent['passed']:
+        raise RuntimeError('template head collision gate failed; nothing exported')
     payload={k:source[k] for k in source.files if k not in ['strands','termination_step']}
     payload['strands']=fitted;payload['valid_point_counts']=sizes
     if 'termination_step' in source:payload['source_termination_step']=source['termination_step']
     payload['source_roots_world']=strands[:,0]
+    payload['template_blend_sha256']=np.array(identity['template_sha256'])
     np.savez_compressed(args.output_dir/'all_root_prefixes.npz',**payload)
     export_all(args.output_dir/'all_root_prefixes.ply',fitted)
     offsets=np.linalg.norm(fitted-original,axis=2);root_offsets=np.linalg.norm(fitted[:,0]-strands[:,0],axis=1)
-    report={'before':before,'after':after,'head_watertight':mesh.is_watertight(),
+    report={'before':before,'after':after,'independent_collision_audit':independent,
+        'template_identity':identity,'head_watertight':mesh.is_watertight(),
         'clearance_m':.0005,'render_bevel_radius_m':.0003,'audit_sample_spacing_m':.000125,
         'source':str(args.input.resolve()),'source_sha256':hashlib.sha256(args.input.read_bytes()).hexdigest(),
         'template_head':str(args.head.resolve()),'head_sha256':hashlib.sha256(args.head.read_bytes()).hexdigest(),

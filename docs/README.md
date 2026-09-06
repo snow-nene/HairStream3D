@@ -27,7 +27,7 @@
 | 积分对照 | `scripts/recon_3d/compare_head_guard_integration.py` | 同批根点、头部约束、逐步归因 |
 | 恢复与反馈实验 | `scripts/recon_3d/recover_boundary_strands.py`、`optimize_typed_hair_geometry.py` | 独立输出，实验约束见对应报告 |
 | 模板适配 | `scripts/render/export_template_head.py` → `scripts/recon_3d/fit_strands_to_template_head.py` | 导出实际渲染头模，再约束发丝间隙 |
-| 全前缀渲染 | `scripts/render/render_all_prefixes.py` | 支持 front、left、right、back 任意组合 |
+| 全前缀渲染 | `scripts/render/render_all_prefixes.py` | 默认要求输入绑定当前 `assets/render_template.blend`；支持 front、left、right、back 任意组合 |
 | 审计 | `scripts/vis/audit_*.py`、`scripts/recon_3d/audit_*.py` | 历史报告依赖的诊断入口保留原路径 |
 
 ```mermaid
@@ -55,3 +55,5 @@ PYTHONDONTWRITEBYTECODE=1 pixi run python -m pytest \
   tests/test_typed_hair_geometry.py tests/test_template_head_fit.py \
   -o cache_dir=/tmp/hairstream3d-pytest-cache
 ```
+
+模板安全渲染必须先导出求值头模并运行适配。适配结果会保存 Blender 模板哈希，渲染入口会拒绝未绑定或哈希不匹配的发丝；`--allow-unbound-template` 只用于历史结果排查，不应作为安全输出。

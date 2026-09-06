@@ -9,15 +9,20 @@ import numpy as np
 from mathutils import Matrix, Vector
 sys.path.insert(0,str(Path(__file__).resolve().parent))
 from render_blender import create_curves_from_strands
+sys.path.insert(0,str(Path(__file__).resolve().parents[2]))
+from lib.template_identity import require_bound_template
 
 
 def main():
     ap=argparse.ArgumentParser(description=__doc__)
     ap.add_argument('--input',type=Path,required=True);ap.add_argument('--output-dir',type=Path,required=True)
     ap.add_argument('--views',nargs='+',choices=['front','left','right','back'],default=['front'])
+    ap.add_argument('--allow-unbound-template',action='store_true',help='仅用于历史结果，不作为模板碰撞安全输出')
     args=ap.parse_args(sys.argv[sys.argv.index('--')+1:])
     args.output_dir.mkdir(parents=True,exist_ok=False)
-    d=np.load(args.input);strands=d['strands'];pieces=[];ids=[]
+    d=np.load(args.input)
+    template_identity=require_bound_template(d,Path('assets/render_template.blend'),args.allow_unbound_template)
+    strands=d['strands'];pieces=[];ids=[]
     for i,s in enumerate(strands):
         keep=np.r_[True,np.linalg.norm(np.diff(s,axis=0),axis=1)>1e-8]
         if keep.sum()>1:pieces.append(s[keep]);ids.append(i)
@@ -42,7 +47,7 @@ def main():
         bpy.ops.render.render(write_still=True)
     cam.matrix_world=original
     bpy.ops.wm.save_as_mainfile(filepath=str((args.output_dir/'all_prefixes.blend').resolve()))
-    report={'source':str(args.input.resolve()),'input_roots':len(strands),'rendered_nonzero_roots':len(ids),'zero_length_roots':len(strands)-len(ids),'selection':'all_nonzero_prefixes_no_termination_filter','views':args.views,'bevel_depth_m':.0003,'samples':32,'rendered_root_indices':ids}
+    report={'source':str(args.input.resolve()),'template_identity':template_identity,'input_roots':len(strands),'rendered_nonzero_roots':len(ids),'zero_length_roots':len(strands)-len(ids),'selection':'all_nonzero_prefixes_no_termination_filter','views':args.views,'bevel_depth_m':.0003,'samples':32,'rendered_root_indices':ids}
     (args.output_dir/'render_report.json').write_text(json.dumps(report,indent=2))
 
 if __name__=='__main__':main()

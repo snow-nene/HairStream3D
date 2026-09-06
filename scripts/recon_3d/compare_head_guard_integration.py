@@ -39,6 +39,25 @@ class HeadSurface:
         return distance.reshape(len(starts), -1).min(axis=1)
 
 
+def independent_collision_audit(strands, mesh, sample_m=0.000125):
+    """Check sampled strand points with closed-mesh ray occupancy."""
+    if not mesh.is_watertight():
+        raise ValueError("independent collision audit requires a watertight head mesh")
+    scene = o3d.t.geometry.RaycastingScene()
+    scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(mesh))
+    samples = []
+    for strand in np.asarray(strands):
+        for start, end in zip(strand[:-1], strand[1:]):
+            count = max(1, int(np.ceil(np.linalg.norm(end - start) / sample_m)))
+            samples.append(start + np.linspace(0, 1, count + 1)[:, None] * (end - start))
+    if not samples:
+        samples = [np.asarray(strands).reshape(-1, 3)]
+    points = np.concatenate(samples, axis=0).astype(np.float32)
+    occupied = scene.compute_occupancy(o3d.core.Tensor(points)).numpy().astype(bool)
+    return {"passed": not bool(occupied.any()), "sampled_points": int(len(points)),
+            "inside_points": int(occupied.sum()), "sample_spacing_m": sample_m}
+
+
 def correct_direction(points, vectors, surface, traveled, clearance, ramp, band):
     distance, normals = surface.query(points)
     target = clearance * np.minimum((traveled + .003) / ramp, 1)
@@ -139,11 +158,14 @@ def integrate(field, labels, roots, parts, low, high, solid, conflict, surface, 
 
 
 def measure(strands, surface):
+    strands = np.asarray(strands)
     lengths = np.linalg.norm(np.diff(strands, axis=1), axis=2)
-    minima = np.full(len(strands), np.inf)
+    minima = surface.query(strands.reshape(-1, 3))[0].reshape(strands.shape[:2]).min(axis=1)
     # 独立更密的线段采样（0.125 mm），包含停滞根点。
     for j in range(strands.shape[1]-1):
         minima = np.minimum(minima, surface.segment_minimum(strands[:, j], strands[:, j+1], .000125))
+    if not np.isfinite(minima).all():
+        raise ValueError('head distance query returned non-finite values')
     return {'roots': len(strands), 'length_quantiles_m': dict(zip(['min','p10','p25','median','p75','p90','max'], np.percentile(lengths.sum(1), [0,10,25,50,75,90,100]).tolist())),
             'zero_length_roots': int((lengths.sum(1)<1e-8).sum()), 'length_over_50mm_roots': int((lengths.sum(1)>.05).sum()),
             'head_inside_1mm_roots': int((minima<-.001).sum()), 'head_inside_3mm_roots': int((minima<-.003).sum()),
