@@ -19,6 +19,7 @@ import taichi as ti
 from .recon_strategy.laplace_pde import LaplacePDEStrategy
 from .recon_strategy.weighted_poisson import (
     build_signed_domain_distance,
+    label_partition_components,
     solve_weighted_screened_poisson,
 )
 from .multiview_fusion import limit_direction_normal_component
@@ -92,7 +93,8 @@ class MultiViewLaplacePDEStrategy(LaplacePDEStrategy):
                         internal_interface_mask: np.ndarray = None,
                         internal_interface_normals: np.ndarray = None,
                         internal_interface_confidence: float = 0.0,
-                        internal_interface_length: float = 0.006):
+                        internal_interface_length: float = 0.006,
+                        partition_labels: np.ndarray = None):
         R = self.resolution
         assert orien_vol.shape == (3, R, R, R)
         self._fused_orien_vol = orien_vol.copy()
@@ -112,6 +114,17 @@ class MultiViewLaplacePDEStrategy(LaplacePDEStrategy):
             internal_interface_confidence
         )
         self._internal_interface_length = float(internal_interface_length)
+        self._partition_labels = (
+            np.asarray(partition_labels).copy()
+            if partition_labels is not None else None
+        )
+        if (
+            self._partition_labels is not None
+            and self._partition_labels.shape != (R, R, R)
+        ):
+            raise ValueError(
+                "partition_labels must have shape (R, R, R)"
+            )
         self._is_multiview = True
 
     def filter(self, data: dict, mesh_path: str = None) -> None:
@@ -167,6 +180,10 @@ class MultiViewLaplacePDEStrategy(LaplacePDEStrategy):
             else binary_dilation(observed, iterations=max(1, self.dilation_iters))
         )
         constraint_domain = domain.copy()
+        strict_volume = getattr(self, "strict_volume_contract", False)
+        if strict_volume:
+            from lib.recon_strategy.partition_direction import nearest_component_sources
+            strict_spacing = (np.asarray(self.b_max)-np.asarray(self.b_min))/(np.asarray(domain.shape)-1)
         unpadded_domain_voxels = int(domain.sum())
         if self.domain_padding_voxels > 0:
             domain = binary_dilation(
@@ -197,6 +214,9 @@ class MultiViewLaplacePDEStrategy(LaplacePDEStrategy):
         _, nearest_observed = distance_transform_edt(
             ~observed, return_indices=True
         )
+        if strict_volume:
+            nearest_observed = nearest_component_sources(
+                domain, self._partition_labels, observed, strict_spacing)
         scalp_values = np.zeros_like(self._fused_orien_vol)
         if scalp_boundary.any():
             nearest_scalp = nearest_observed[:, scalp_boundary]
@@ -223,6 +243,9 @@ class MultiViewLaplacePDEStrategy(LaplacePDEStrategy):
         _, nearest_hard = distance_transform_edt(
             ~hard_boundary, return_indices=True
         )
+        if strict_volume:
+            nearest_hard = nearest_component_sources(
+                domain, self._partition_labels, hard_boundary, strict_spacing)
         soft_values = np.zeros_like(hard_values)
         soft_weight = np.zeros_like(domain, dtype=np.float32)
         accepted_side = np.zeros_like(domain, dtype=bool)
@@ -261,13 +284,21 @@ class MultiViewLaplacePDEStrategy(LaplacePDEStrategy):
         # Components with no hard or soft observation make the operator
         # singular and cannot produce meaningful root-to-tip flow. Remove them
         # explicitly and report the governance action.
-        components, component_count = label(domain)
+        partition_labels = self._partition_labels
+        components, component_count = label_partition_components(
+            domain, partition_labels
+        )
         anchors = hard_boundary | (soft_weight > 0.0)
         anchored_ids = np.unique(components[anchors])
         anchored_ids = anchored_ids[anchored_ids > 0]
         kept_domain = np.isin(components, anchored_ids)
         removed_voxels = int(domain.sum() - kept_domain.sum())
         removed_components = int(component_count - len(anchored_ids))
+        if getattr(self, "strict_volume_contract", False) and removed_components:
+            raise ValueError(
+                f"Strict volume has {removed_components} unanchored components "
+                f"({removed_voxels} voxels); refusing domain pruning"
+            )
         domain = kept_domain | hard_boundary | accepted_side
         self._pde_domain = domain
 
@@ -276,6 +307,9 @@ class MultiViewLaplacePDEStrategy(LaplacePDEStrategy):
         _, nearest_source = distance_transform_edt(
             ~initial_sources, return_indices=True
         )
+        if strict_volume:
+            nearest_source = nearest_component_sources(
+                domain, self._partition_labels, initial_sources, strict_spacing)
         initial = np.zeros_like(hard_values)
         source_ids = nearest_source[:, domain]
         initial[:, domain] = initial_values[
@@ -360,6 +394,8 @@ class MultiViewLaplacePDEStrategy(LaplacePDEStrategy):
             tolerance=self.cg_tol,
             max_iterations=self.cg_maxiter,
             initial_field=initial,
+            partition_labels=partition_labels,
+            require_component_convergence=getattr(self, "strict_volume_contract", False),
             device=self.cuda,
             dtype=torch.float32,
             validate_components=True,
@@ -378,6 +414,10 @@ class MultiViewLaplacePDEStrategy(LaplacePDEStrategy):
             "unpadded_domain_voxels": unpadded_domain_voxels,
             "side_constraint_mode": self.side_constraint_mode,
             "side_hard_voxels": int(side_hard.sum()),
+            "partition_count": (
+                int(len(np.unique(partition_labels[domain])))
+                if partition_labels is not None else 1
+            ),
         })
         print(
             '  PDE solved: '
@@ -387,10 +427,28 @@ class MultiViewLaplacePDEStrategy(LaplacePDEStrategy):
             f'time={metrics.elapsed_seconds:.2f}s'
         )
         if not metrics.converged:
+            component_detail = ""
+            components = metrics.component_residuals or []
+            failed = [item for item in components if not item.get("converged", False)]
+            if failed:
+                worst = max(
+                    failed,
+                    key=lambda item: float(
+                        item.get("relative_residual")
+                        if item.get("relative_residual") is not None
+                        else item.get("absolute_residual", 0.0)
+                    ),
+                )
+                component_detail = (
+                    f", failed_components={len(failed)}, "
+                    f"worst_component={worst.get('component_id')}, "
+                    f"worst_relative_residual={worst.get('relative_residual')}, "
+                    f"worst_absolute_residual={worst.get('absolute_residual')}"
+                )
             raise RuntimeError(
                 "screened-Poisson did not converge: "
                 f"residual={metrics.final_relative_residual:.3e}, "
-                f"breakdown={metrics.breakdown}"
+                f"breakdown={metrics.breakdown}{component_detail}"
             )
 
         norms = np.linalg.norm(solved, axis=0, keepdims=True)

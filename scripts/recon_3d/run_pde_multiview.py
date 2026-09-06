@@ -70,6 +70,220 @@ def query_grid(vol_5d, points_3n, b_min_tensor, b_max_tensor):
     return value.squeeze(-1).squeeze(-1).squeeze(0)
 
 
+def query_partition_labels(
+    partition_vol,
+    points_3n,
+    b_min_tensor,
+    b_max_tensor,
+):
+    """Sample discrete 3D partition labels with nearest-neighbor lookup."""
+
+    if partition_vol.ndim != 5 or partition_vol.shape[:2] != (1, 1):
+        raise ValueError("partition_vol must have shape (1, 1, X, Y, Z)")
+    points_3n = points_3n.reshape(3, -1)
+    b_min_tensor = b_min_tensor.reshape(3, 1)
+    b_max_tensor = b_max_tensor.reshape(3, 1)
+    uv = (points_3n.unsqueeze(0) - b_min_tensor) / (
+        b_max_tensor - b_min_tensor
+    )
+    uv = uv * 2.0 - 1.0
+    grid = uv.permute(0, 2, 1)
+    grid = grid[..., [2, 1, 0]].unsqueeze(2).unsqueeze(2)
+    labels = torch.nn.functional.grid_sample(
+        partition_vol.to(dtype=torch.float32),
+        grid,
+        mode="nearest",
+        padding_mode="border",
+        align_corners=True,
+    )
+    return labels.squeeze(-1).squeeze(-1).squeeze(0).squeeze(0).long()
+
+
+def query_partitioned_grid(
+    vol_5d,
+    partition_vol,
+    points_3n,
+    root_labels,
+    b_min_tensor,
+    b_max_tensor,
+    min_support=1e-4,
+    strict_bounds=False,
+):
+    """Trilinearly sample a field using only each root's partition voxels.
+
+    The numerator samples ``field * partition_mask`` and the denominator
+    samples ``partition_mask``. Dividing the two removes contributions from
+    other labels without degrading same-label interpolation to nearest-neighbor.
+    """
+
+    if vol_5d.ndim != 5 or vol_5d.shape[0] != 1:
+        raise ValueError("vol_5d must have shape (1, C, X, Y, Z)")
+    if partition_vol.ndim != 5 or partition_vol.shape[:2] != (1, 1):
+        raise ValueError("partition_vol must have shape (1, 1, X, Y, Z)")
+    if vol_5d.shape[2:] != partition_vol.shape[2:]:
+        raise ValueError("field and partition volumes must share a grid")
+    if min_support <= 0.0:
+        raise ValueError("min_support must be positive")
+
+    points = points_3n.reshape(3, -1)
+    labels = root_labels.to(device=points.device, dtype=torch.long).reshape(-1)
+    if labels.numel() != points.shape[1]:
+        raise ValueError("root_labels must match the number of query points")
+    if torch.any(labels <= 0):
+        raise ValueError("root_labels must contain positive partition IDs")
+
+    result = torch.zeros(
+        (vol_5d.shape[1], points.shape[1]),
+        dtype=vol_5d.dtype,
+        device=vol_5d.device,
+    )
+    support = torch.zeros(
+        points.shape[1], dtype=vol_5d.dtype, device=vol_5d.device
+    )
+    for partition_id in torch.unique(labels):
+        selected = labels == partition_id
+        mask = (partition_vol == partition_id).to(dtype=vol_5d.dtype)
+        local_support = query_grid(
+            mask,
+            points[:, selected],
+            b_min_tensor,
+            b_max_tensor,
+        ).squeeze(0)
+        numerator = query_grid(
+            vol_5d * mask,
+            points[:, selected],
+            b_min_tensor,
+            b_max_tensor,
+        )
+        usable = local_support >= float(min_support)
+        local_values = numerator / torch.clamp(
+            local_support.unsqueeze(0), min=float(min_support)
+        )
+        result[:, selected] = torch.where(
+            usable.unsqueeze(0), local_values, torch.zeros_like(local_values)
+        )
+        support[selected] = local_support
+    if strict_bounds:
+        inside = ((points >= b_min_tensor.reshape(3, 1))
+                  & (points <= b_max_tensor.reshape(3, 1))).all(dim=0)
+        result[:, ~inside] = 0.0
+        support[~inside] = 0.0
+    return result, support
+
+
+def enforce_partition_candidate(
+    candidate,
+    step_origin,
+    root_labels,
+    partition_vol,
+    b_min_tensor,
+    b_max_tensor,
+    bisection_iterations=8,
+):
+    """Move cross-partition candidates to the last valid point of the step."""
+
+    candidate = candidate.reshape(3, -1)
+    step_origin = step_origin.reshape(3, -1)
+    labels = root_labels.to(device=candidate.device, dtype=torch.long).reshape(-1)
+    if candidate.shape != step_origin.shape:
+        raise ValueError("candidate and step_origin must share shape (3, N)")
+    if labels.numel() != candidate.shape[1]:
+        raise ValueError("root_labels must match candidate count")
+    if torch.any(labels <= 0):
+        raise ValueError("root_labels must contain positive partition IDs")
+    if int(bisection_iterations) < 1:
+        raise ValueError("bisection_iterations must be positive")
+
+    candidate_labels = query_partition_labels(
+        partition_vol,
+        candidate,
+        b_min_tensor,
+        b_max_tensor,
+    )
+    crossed = candidate_labels != labels
+    if not crossed.any():
+        return candidate, crossed
+
+    low = torch.zeros(candidate.shape[1], device=candidate.device)
+    high = torch.ones_like(low)
+    low[~crossed] = 1.0
+    segment = candidate - step_origin
+    for _ in range(int(bisection_iterations)):
+        middle = 0.5 * (low + high)
+        probe = step_origin + middle.unsqueeze(0) * segment
+        probe_labels = query_partition_labels(
+            partition_vol,
+            probe,
+            b_min_tensor,
+            b_max_tensor,
+        )
+        valid = probe_labels == labels
+        low = torch.where(crossed & valid, middle, low)
+        high = torch.where(crossed & ~valid, middle, high)
+
+    corrected = step_origin + low.unsqueeze(0) * segment
+    corrected = torch.where(crossed.unsqueeze(0), corrected, candidate)
+    final_labels = query_partition_labels(
+        partition_vol,
+        corrected,
+        b_min_tensor,
+        b_max_tensor,
+    )
+    unresolved = crossed & (final_labels != labels)
+    corrected = torch.where(
+        unresolved.unsqueeze(0), step_origin, corrected
+    )
+    return corrected, crossed
+
+
+def select_partitioned_guide_indices(
+    squared_distances,
+    guide_partition_labels=None,
+    root_partition_labels=None,
+):
+    """Select the nearest guide while forbidding cross-partition matches."""
+
+    if squared_distances.ndim != 2:
+        raise ValueError("squared_distances must have shape (guides, roots)")
+    partition_enabled = (
+        guide_partition_labels is not None or root_partition_labels is not None
+    )
+    if not partition_enabled:
+        return torch.argmin(squared_distances, dim=0)
+    if guide_partition_labels is None or root_partition_labels is None:
+        raise ValueError(
+            "guide and root partition labels must be provided together"
+        )
+    guide_labels = guide_partition_labels.to(
+        device=squared_distances.device, dtype=torch.long
+    ).reshape(-1)
+    root_labels = root_partition_labels.to(
+        device=squared_distances.device, dtype=torch.long
+    ).reshape(-1)
+    if guide_labels.numel() != squared_distances.shape[0]:
+        raise ValueError("guide labels must match the guide dimension")
+    if root_labels.numel() != squared_distances.shape[1]:
+        raise ValueError("root labels must match the root dimension")
+    if torch.any(guide_labels <= 0) or torch.any(root_labels <= 0):
+        raise ValueError("guide and root labels must be positive")
+
+    active_partition_ids = torch.unique(root_labels)
+    guide_partition_ids = torch.unique(guide_labels)
+    missing = active_partition_ids[
+        ~torch.isin(active_partition_ids, guide_partition_ids)
+    ]
+    if missing.numel() > 0:
+        raise RuntimeError(
+            "Guide strands do not cover all root partitions: "
+            f"missing={missing.cpu().tolist()}"
+        )
+    same_partition = guide_labels.unsqueeze(1) == root_labels.unsqueeze(0)
+    gated_distances = squared_distances.masked_fill(
+        ~same_partition, float("inf")
+    )
+    return torch.argmin(gated_distances, dim=0)
+
+
 def project_points(points_3d, calib_tensor):
     """Project 3D points to image NDC coordinates."""
     num_points = points_3d.shape[1]
@@ -429,10 +643,16 @@ def hair_synthesis_rk4(
     parting_barrier_back_cap_radius_px=0.0,
     parting_interface_vol=None,
     parting_interface_normal_vol=None,
+    partition_label_vol=None,
+    root_partition_labels=None,
+    partition_min_support=1e-4,
+    partition_bisection_iterations=8,
+    volume_segment_guard=False,
     root_collision_ramp_steps=0,
     root_collision_start_distance=0.0015,
     return_diagnostics=False,
     label="",
+    volume_bounds=None,
 ):
     """Trace strands with RK4 integration and continuous collision response.
 
@@ -450,6 +670,71 @@ def hair_synthesis_rk4(
     current = root_tensor.squeeze(0)
     hair_strands[0] = current
     previous_direction = None
+
+    partition_enabled = (
+        partition_label_vol is not None or root_partition_labels is not None
+    )
+    if volume_segment_guard and not partition_enabled:
+        raise ValueError("volume_segment_guard requires domain-masked partition labels")
+    if partition_enabled and (
+        partition_label_vol is None or root_partition_labels is None
+    ):
+        raise ValueError(
+            "partition_label_vol and root_partition_labels must be provided together"
+        )
+    guard_low, guard_high = (b_min_t, b_max_t) if volume_bounds is None else volume_bounds
+    partition_orien_vol = None
+    partition_root_labels = None
+    if partition_enabled:
+        if b_min_t is None or b_max_t is None:
+            raise ValueError("partition-aware RK4 requires b_min_t and b_max_t")
+        partition_root_labels = root_partition_labels.to(
+            device=cuda, dtype=torch.long
+        ).reshape(-1)
+        if partition_root_labels.numel() != num_strands:
+            raise ValueError(
+                "root_partition_labels must match the number of roots"
+            )
+        if torch.any(partition_root_labels <= 0):
+            invalid = int((partition_root_labels <= 0).sum())
+            raise ValueError(
+                "partition-aware RK4 requires positive root labels; "
+                f"invalid_roots={invalid}"
+            )
+        partition_label_vol = partition_label_vol.to(
+            device=cuda, dtype=torch.long
+        )
+        sampled_root_labels = query_partition_labels(
+            partition_label_vol,
+            current,
+            b_min_t,
+            b_max_t,
+        )
+        mismatched_roots = sampled_root_labels != partition_root_labels
+        if mismatched_roots.any():
+            raise ValueError(
+                "root_partition_labels disagree with the partition volume; "
+                f"mismatched_roots={int(mismatched_roots.sum())}"
+            )
+        partition_orien_vol = torch.as_tensor(
+            strategy._orien_vol, dtype=torch.float32, device=cuda
+        ).unsqueeze(0)
+        if partition_orien_vol.shape[2:] != partition_label_vol.shape[2:]:
+            raise ValueError(
+                "orientation and partition volumes must share a grid"
+            )
+        if volume_segment_guard:
+            from lib.recon_strategy.volume_segment_guard import first_invalid_segment_fraction
+            root_hits = first_invalid_segment_fraction(
+                current.T, current.T, partition_root_labels,
+                partition_label_vol[0, 0], guard_low, guard_high,
+            )
+            if torch.isfinite(root_hits).any():
+                raise ValueError("Strict volume roots touch outside domain or another partition")
+            spacing = (b_max_t.reshape(3) - b_min_t.reshape(3)) / (
+                torch.tensor(partition_label_vol.shape[2:], device=cuda) - 1
+            )
+            hair_unit = min(float(hair_unit), 0.5 * float(spacing.min()))
 
     alive = torch.ones(num_strands, dtype=torch.bool, device=cuda)
     grace_budget = max(0, int(silhouette_grace_steps))
@@ -470,6 +755,13 @@ def hair_synthesis_rk4(
     parting_barrier_projection_total = 0
     parting_interface_total = 0
     parting_interface_freeze_total = 0
+    partition_crossing_total = 0
+    volume_crossing_total = 0
+    volume_step_retries = 0
+    volume_low_support_stops = 0
+    first_partition_crossing_step = torch.full_like(
+        first_low_field_step, -1
+    )
     depth_bias_weight_t = None
     if depth_bias_direction is not None:
         if torch.is_tensor(depth_bias_weight):
@@ -524,10 +816,26 @@ def hair_synthesis_rk4(
         reference_direction=None,
         return_low=False,
     ):
-        direction = strategy.query(points, calib_tensor).squeeze(0)
-        low = torch.norm(direction, dim=0) < 0.05
+        if partition_enabled:
+            direction, partition_support = query_partitioned_grid(
+                partition_orien_vol,
+                partition_label_vol,
+                points.squeeze(0),
+                partition_root_labels,
+                b_min_t,
+                b_max_t,
+                min_support=partition_min_support,
+                strict_bounds=volume_segment_guard,
+            )
+            low = (
+                partition_support < float(partition_min_support)
+            ) | (torch.norm(direction, dim=0) < 0.05)
+        else:
+            direction = strategy.query(points, calib_tensor).squeeze(0)
+            low = torch.norm(direction, dim=0) < 0.05
         if (
             local_domain_recovery
+            and not volume_segment_guard
             and domain_sdf_vol is not None
             and domain_normal_vol is not None
             and low.any()
@@ -546,10 +854,27 @@ def hair_synthesis_rk4(
                 local_domain_recovery_margin,
                 domain_projection_epsilon,
             ).unsqueeze(0)
-            recovered = strategy.query(
-                recovered_points, calib_tensor
-            ).squeeze(0)
+            if partition_enabled:
+                recovered, recovered_support = query_partitioned_grid(
+                    partition_orien_vol,
+                    partition_label_vol,
+                    recovered_points.squeeze(0),
+                    partition_root_labels,
+                    b_min_t,
+                    b_max_t,
+                    min_support=partition_min_support,
+                )
+            else:
+                recovered = strategy.query(
+                    recovered_points, calib_tensor
+                ).squeeze(0)
+                recovered_support = torch.ones(
+                    recovered.shape[1], device=recovered.device
+                )
             recovered_valid = torch.norm(recovered, dim=0) >= 0.05
+            recovered_valid &= (
+                recovered_support >= float(partition_min_support)
+            )
             recoverable = domain_sdf >= -float(local_domain_recovery_margin)
             if reference_direction is not None:
                 reference_unit = normalize_nonzero(reference_direction)
@@ -572,7 +897,11 @@ def hair_synthesis_rk4(
             )
             low = torch.norm(direction, dim=0) < 0.05
         use_fallback = low & fallback_mask
-        if use_fallback.any() and hasattr(strategy, "query_fallback"):
+        if (
+            not partition_enabled
+            and use_fallback.any()
+            and hasattr(strategy, "query_fallback")
+        ):
             fallback = strategy.query_fallback(points, calib_tensor).squeeze(0)
             direction = torch.where(use_fallback.unsqueeze(0), fallback, direction)
         if domain_sdf_vol is not None and domain_normal_vol is not None:
@@ -590,6 +919,8 @@ def hair_synthesis_rk4(
                 domain_guard_margin,
                 domain_guard_inward_bias,
             )
+        if volume_segment_guard:
+            direction = normalize_nonzero(direction)
         return (direction, low) if return_low else direction
 
     for index in range(1, num_sample):
@@ -626,6 +957,17 @@ def hair_synthesis_rk4(
         )
         k4 = align_vector_sign(k4, k3)
         direction = (k1 + 2 * k2 + 2 * k3 + k4) / 6.0
+        step_length = hair_unit
+        if volume_segment_guard:
+            from lib.recon_strategy.volume_rk4 import adaptive_partition_rk4
+            direction, step_length, unsupported, retries = adaptive_partition_rk4(
+                current, previous_direction,
+                lambda position: query_direction(position.unsqueeze(0), fallback_mask, return_low=True),
+                hair_unit, hair_unit / 64.0,
+            )
+            volume_step_retries += int(retries[alive].sum())
+            volume_low_support_stops += int((unsupported & alive).sum())
+            alive &= ~unsupported
         if previous_direction is not None:
             direction = align_vector_sign(direction, previous_direction)
         progress = index / float(num_sample)
@@ -780,7 +1122,7 @@ def hair_synthesis_rk4(
         if not actual_displacement_feedback:
             previous_direction = direction
 
-        current = current + hair_unit * direction
+        current = current + step_length * direction
         if depth_layer_offset_t is not None:
             current = current + (
                 depth_bias_direction
@@ -1024,6 +1366,33 @@ def hair_synthesis_rk4(
                 final_side_projection.sum()
             )
 
+        if partition_enabled:
+            current, crossed_partition = enforce_partition_candidate(
+                current,
+                step_origin,
+                partition_root_labels,
+                partition_label_vol,
+                b_min_t,
+                b_max_t,
+                bisection_iterations=partition_bisection_iterations,
+            )
+            active_crossing = alive & crossed_partition
+            partition_crossing_total += int(active_crossing.sum())
+            first_crossing = (
+                active_crossing & (first_partition_crossing_step < 0)
+            )
+            first_partition_crossing_step[first_crossing] = index
+
+        if volume_segment_guard:
+            from lib.recon_strategy.volume_segment_guard import constrain_volume_segments
+            corrected, volume_crossing = constrain_volume_segments(
+                step_origin.T, current.T, partition_root_labels,
+                partition_label_vol[0, 0], guard_low, guard_high,
+            )
+            current = corrected.T
+            volume_crossing_total += int((alive & volume_crossing).sum())
+            alive &= ~volume_crossing
+
         if actual_displacement_feedback:
             actual_direction = (current - step_origin) / max(hair_unit, 1e-8)
             actual_valid = torch.norm(actual_direction, dim=0) > 1e-8
@@ -1046,6 +1415,7 @@ def hair_synthesis_rk4(
     low_steps = first_low_field_step.cpu().numpy()
     domain_steps = first_domain_exit_step.cpu().numpy()
     silhouette_steps = first_silhouette_step.cpu().numpy()
+    partition_steps = first_partition_crossing_step.cpu().numpy()
     segment_lengths = np.linalg.norm(
         strands_np[:, 1:] - strands_np[:, :-1], axis=2
     )
@@ -1071,7 +1441,34 @@ def hair_synthesis_rk4(
         ~silhouette_seen | (low_steps <= silhouette_steps)
     )
     effective_quantiles = np.quantile(effective_points, [0.1, 0.5, 0.9])
+    partition_root_counts = {}
+    final_partition_violation_samples = 0
+    final_partition_violation_strands = 0
+    if partition_enabled:
+        root_labels_np = partition_root_labels.detach().cpu().numpy()
+        unique_labels, unique_counts = np.unique(
+            root_labels_np, return_counts=True
+        )
+        partition_root_counts = {
+            str(int(partition_id)): int(count)
+            for partition_id, count in zip(unique_labels, unique_counts)
+        }
+        flattened_points = hair_strands.permute(1, 0, 2).reshape(3, -1)
+        final_labels = query_partition_labels(
+            partition_label_vol,
+            flattened_points,
+            b_min_t,
+            b_max_t,
+        ).reshape(num_sample, num_strands)
+        violations = final_labels != partition_root_labels.unsqueeze(0)
+        final_partition_violation_samples = int(violations.sum())
+        final_partition_violation_strands = int(violations.any(dim=0).sum())
     diagnostics = {
+        "volume_segment_guard": bool(volume_segment_guard),
+        "volume_segment_stops": int(volume_crossing_total),
+        "volume_step_retries": int(volume_step_retries),
+        "volume_low_support_stops": int(volume_low_support_stops),
+        "effective_hair_unit": float(hair_unit),
         "label": label or "rk4",
         "num_strands": int(num_strands),
         "num_samples": int(num_sample),
@@ -1090,6 +1487,16 @@ def hair_synthesis_rk4(
         "parting_interface_events": int(parting_interface_total),
         "parting_interface_freeze_events": int(
             parting_interface_freeze_total
+        ),
+        "partition_guard_enabled": bool(partition_enabled),
+        "partition_root_counts": partition_root_counts,
+        "partition_crossing_candidates": int(partition_crossing_total),
+        "first_partition_crossing_step": summarize_steps(partition_steps),
+        "final_partition_violation_samples": int(
+            final_partition_violation_samples
+        ),
+        "final_partition_violation_strands": int(
+            final_partition_violation_strands
         ),
         "non_silhouette_stalls": int(
             ((effective_points < num_sample) & ~silhouette_seen).sum()
@@ -2303,6 +2710,66 @@ def build_front_parting_interface_constraints(
     return interface, normals
 
 
+def build_front_partition_volume(
+    partition_labels,
+    calib,
+    b_min,
+    b_max,
+    resolution,
+    chunk_size=8,
+):
+    """把 front 二维分区标签沿相机投影提升到完整三维体素网格。"""
+
+    from scipy.ndimage import distance_transform_edt
+
+    labels_2d = np.asarray(partition_labels)
+    if labels_2d.ndim != 2:
+        raise ValueError("front partition labels 必须是二维数组")
+    valid = labels_2d > 0
+    partition_ids = np.unique(labels_2d[valid])
+    if len(partition_ids) < 2:
+        raise ValueError("front partition labels 至少需要两个非零分区")
+    if np.any(~valid):
+        nearest = distance_transform_edt(
+            ~valid, return_distances=False, return_indices=True
+        )
+        labels_2d = labels_2d[tuple(nearest)]
+
+    matrix = np.asarray(
+        calib[0] if isinstance(calib, (tuple, list)) else calib,
+        dtype=np.float64,
+    )
+    if matrix.shape != (4, 4):
+        raise ValueError("front calibration 必须是 4x4 矩阵")
+    shape = (int(resolution),) * 3
+    axes = [
+        np.linspace(float(b_min[i]), float(b_max[i]), shape[i])
+        for i in range(3)
+    ]
+    volume = np.zeros(shape, dtype=np.int16)
+    height, width = labels_2d.shape
+    step = max(1, int(chunk_size))
+    for start in range(0, shape[0], step):
+        stop = min(start + step, shape[0])
+        grid = np.stack(
+            np.meshgrid(
+                axes[0][start:stop], axes[1], axes[2], indexing="ij"
+            ),
+            axis=-1,
+        ).reshape(-1, 3)
+        homogeneous = np.column_stack([grid, np.ones(len(grid))])
+        clip = homogeneous @ matrix.T
+        uv = clip[:, :2] / (clip[:, 3:4] + 1e-12)
+        px = np.rint((uv[:, 0] + 1.0) * 0.5 * (width - 1))
+        py = np.rint((uv[:, 1] + 1.0) * 0.5 * (height - 1))
+        px = np.clip(px.astype(np.int64), 0, width - 1)
+        py = np.clip(py.astype(np.int64), 0, height - 1)
+        volume[start:stop] = labels_2d[py, px].reshape(
+            stop - start, shape[1], shape[2]
+        )
+    return volume
+
+
 def load_blender_view_calibration(data_dir, view):
     """把 Blender 真值相机转换为 HairStep-world → image-NDC 标定。
 
@@ -2474,6 +2941,14 @@ def main():
         "--front_parting_pde_interface",
         action="store_true",
         help="将发缝作为 PDE 域内无穿透滑移界面，而不是挖空求解域",
+    )
+    parser.add_argument(
+        "--front_partition_labels",
+        default=None,
+        help=(
+            "front 二维分区标签 .npy；启用后 screened-Poisson 不在"
+            "不同非零标签之间建立扩散耦合"
+        ),
     )
     parser.add_argument(
         "--front_parting_interface_surface_height",
@@ -2990,7 +3465,19 @@ def main():
         default="auto",
         help="PyTorch execution device; auto falls back to CPU when CUDA is unavailable",
     )
+    parser.add_argument("--volume_partition_bundle", default=None,
+                        help="统一体积/分区 NPZ；显式启用严格域和整线段约束")
     args = parser.parse_args()
+    volume_bundle = None
+    if args.volume_partition_bundle:
+        from lib.recon_strategy.volume_partition import load_bundle
+        volume_bundle, volume_metadata = load_bundle(args.volume_partition_bundle)
+        if args.pde_solver_mode != "screened_poisson":
+            raise ValueError("volume bundle requires screened_poisson")
+        if args.front_partition_labels or args.pde_domain_padding_voxels:
+            raise ValueError("volume bundle cannot combine with front labels or domain padding")
+        if args.export_per_view:
+            raise ValueError("Independent per-view export is not volume-constrained")
 
     if args.device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("--device cuda was requested, but CUDA is unavailable")
@@ -3009,7 +3496,21 @@ def main():
     
     out_dir = args.out_dir if args.out_dir else os.path.join(data_dir, "pde_reconstruction")
     out_ply = os.path.join(out_dir, "hair_multiview.ply")
+    if volume_bundle is not None:
+        from pathlib import Path
+        expected_output = (Path(data_dir) / "pde_governance/volume_partition_integration").resolve()
+        if expected_output not in Path(out_dir).resolve().parents:
+            raise ValueError("Strict volume output must use image pde_governance/volume_partition_integration/<run_id>")
+        np.random.seed(42)
+        torch.manual_seed(42)
     os.makedirs(out_dir, exist_ok=True)
+    if volume_bundle is not None:
+        import hashlib
+        with open(os.path.join(out_dir, "run_manifest.json"), "w") as stream:
+            json.dump({"arguments": vars(args), "seed": 42,
+                       "bundle_sha256": hashlib.sha256(Path(args.volume_partition_bundle).read_bytes()).hexdigest(),
+                       "entrypoint_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                       "bundle_metadata": volume_metadata}, stream, indent=2)
 
     # ================================================================
     #  1. Load multi-view strand_maps + depth_maps
@@ -3576,6 +4077,43 @@ def main():
             f"confidence={args.front_parting_interface_confidence:.3f}"
         )
 
+    partition_volume_np = None
+    if volume_bundle is not None:
+        origin = np.asarray(volume_metadata["origin"])
+        spacing = np.asarray(volume_metadata["spacing"])
+        expected_max = origin + spacing * (np.asarray(volume_bundle["domain_mask"].shape) - 1)
+        if (volume_bundle["domain_mask"].shape != hair_volume.shape
+                or not np.allclose(origin, b_min, atol=1e-7)
+                or not np.allclose(expected_max, b_max, atol=1e-7)):
+            raise ValueError("Volume bundle grid differs from reconstruction grid; explicit resampling required")
+        hair_volume = volume_bundle["domain_mask"].copy()
+        partition_volume_np = volume_bundle["partition_labels"].copy()
+        boundary_mask &= hair_volume
+        fused_orien[:, ~boundary_mask] = 0
+        view_ownership[~boundary_mask] = -1
+    if args.front_partition_labels:
+        if args.pde_solver_mode != "screened_poisson":
+            raise ValueError(
+                "--front_partition_labels 仅支持 --pde_solver_mode screened_poisson"
+            )
+        labels_path = os.path.abspath(args.front_partition_labels)
+        labels_2d = np.load(labels_path)
+        partition_volume_np = build_front_partition_volume(
+            labels_2d,
+            geometry_calibs["front"],
+            b_min,
+            b_max,
+            args.pde_resolution,
+        )
+        active_partition_ids, active_partition_counts = np.unique(
+            partition_volume_np[hair_volume], return_counts=True
+        )
+        print(
+            "  Front partitioned PDE: "
+            f"source={labels_path}, labels="
+            f"{dict(zip(active_partition_ids.tolist(), active_partition_counts.tolist()))}"
+        )
+
     # Save fusion and outer-shell debug data.
     np.savez_compressed(
         os.path.join(out_dir, "fusion_debug.npz"),
@@ -3589,6 +4127,11 @@ def main():
             parting_interface_np
             if parting_interface_np is not None
             else np.zeros_like(hair_volume, dtype=bool)
+        ),
+        partition_labels=(
+            partition_volume_np
+            if partition_volume_np is not None
+            else np.zeros_like(hair_volume, dtype=np.int16)
         ),
     )
     print(f"  Fusion debug saved.")
@@ -3629,7 +4172,7 @@ def main():
     opt_pde = argparse.Namespace()
     opt_pde.pde_resolution = args.pde_resolution
     opt_pde.pde_dilation_iters = args.pde_dilation_iters
-    opt_pde.pde_cg_tol = args.pde_cg_tol
+    opt_pde.pde_cg_tol = min(args.pde_cg_tol, 1e-4) if volume_bundle is not None else args.pde_cg_tol
     opt_pde.pde_cg_maxiter = args.pde_cg_maxiter
     opt_pde.pde_anisotropy = args.pde_anisotropy
     opt_pde.pde_solver_mode = args.pde_solver_mode
@@ -3649,8 +4192,9 @@ def main():
     opt_pde.b_max = b_max_val
 
     has_side_views = any(v != "front" for v in valid_views)
-    if has_side_views:
+    if has_side_views or volume_bundle is not None:
         strategy = MultiViewLaplacePDEStrategy(opt_pde, cuda)
+        strategy.strict_volume_contract = volume_bundle is not None
         strategy.set_fused_data(
             fused_orien,
             boundary_mask,
@@ -3663,15 +4207,24 @@ def main():
                 args.front_parting_interface_confidence
             ),
             internal_interface_length=args.front_parting_interface_length,
+            partition_labels=partition_volume_np,
         )
         print("  Using fused multi-view orientation boundary")
     else:
+        if partition_volume_np is not None:
+            raise ValueError("分区 PDE 当前要求至少包含一个非 front 视角")
         strategy = LaplacePDEStrategy(opt_pde, cuda)
         print("  Using original front-only orientation field")
-    strategy.filter(
-        data,
-        mesh_path=aligned_surface_path if has_side_views else args.mesh_obj,
-    )
+    try:
+        strategy.filter(
+            data,
+            mesh_path=aligned_surface_path if has_side_views else args.mesh_obj,
+        )
+    except (ValueError, RuntimeError) as error:
+        if volume_bundle is not None:
+            with open(os.path.join(out_dir, "pde_failure.json"), "w") as stream:
+                json.dump({"error": str(error), "metrics": getattr(strategy, "solver_metrics", None)}, stream, indent=2)
+        raise
     strategy.set_query_mode("orien")
     if getattr(strategy, "solver_metrics", None) is not None:
         metrics_path = os.path.join(out_dir, "pde_solver_metrics.json")
@@ -3835,6 +4388,35 @@ def main():
             f"[Root Projection] corrected samples={projected_count}, "
             f"target={args.root_surface_distance:.4f}m, "
             f"iterations={args.root_projection_iterations}"
+        )
+    partition_label_vol = None
+    root_partition_labels = None
+    if partition_volume_np is not None:
+        partition_label_vol = (
+            torch.from_numpy(partition_volume_np)
+            .long()
+            .unsqueeze(0)
+            .unsqueeze(0)
+            .to(cuda)
+        )
+        root_partition_labels = query_partition_labels(
+            partition_label_vol,
+            root_tensor.squeeze(0),
+            b_min_t,
+            b_max_t,
+        )
+        invalid_partition_roots = root_partition_labels <= 0
+        if invalid_partition_roots.any():
+            raise ValueError(
+                "三维分区标签未覆盖全部 RK4 roots: "
+                f"invalid={int(invalid_partition_roots.sum())}"
+            )
+        root_partition_ids, root_partition_counts = torch.unique(
+            root_partition_labels, return_counts=True
+        )
+        print(
+            "  RK4 root partitions: "
+            f"{dict(zip(root_partition_ids.cpu().tolist(), root_partition_counts.cpu().tolist()))}"
         )
     calib_tensor = (
         torch.from_numpy(geometry_calibs["front"][0]).float().unsqueeze(0).to(cuda)
@@ -4117,6 +4699,10 @@ def main():
 
     guide_idx_tensor = torch.tensor(guide_idx_list, device=cuda)
     guide_roots = root_tensor[:, :, guide_idx_tensor]
+    guide_partition_labels = (
+        root_partition_labels[guide_idx_tensor]
+        if root_partition_labels is not None else None
+    )
 
     centroids_t = torch.tensor(centroids_list, device=cuda)
 
@@ -4130,7 +4716,19 @@ def main():
             root_layers.unsqueeze(0) * args.root_layer_cluster_scale_px
             - centroids_t[:, 2].unsqueeze(1)
         ) ** 2
-    guide_indices_t = torch.argmin(dist_sq_all, dim=0)
+    guide_indices_t = select_partitioned_guide_indices(
+        dist_sq_all,
+        guide_partition_labels,
+        root_partition_labels,
+    )
+    if root_partition_labels is not None:
+        active_partition_ids = torch.unique(root_partition_labels)
+        guide_partition_ids = torch.unique(guide_partition_labels)
+        print(
+            "  Partition-aware guide matching: "
+            f"root_labels={active_partition_ids.cpu().tolist()}, "
+            f"guide_labels={guide_partition_ids.cpu().tolist()}"
+        )
 
     # Trace guide strands
     print("  Tracing 1024 guide strands...")
@@ -4210,6 +4808,10 @@ def main():
         ),
         parting_interface_vol=parting_interface_vol,
         parting_interface_normal_vol=parting_interface_normal_vol,
+        partition_label_vol=partition_label_vol,
+        root_partition_labels=guide_partition_labels,
+        volume_segment_guard=volume_bundle is not None,
+        volume_bounds=(origin, expected_max) if volume_bundle is not None else None,
         root_collision_ramp_steps=args.rk4_root_collision_ramp_steps,
         root_collision_start_distance=(
             args.rk4_root_collision_start_distance
@@ -4290,6 +4892,10 @@ def main():
         ),
         parting_interface_vol=parting_interface_vol,
         parting_interface_normal_vol=parting_interface_normal_vol,
+        partition_label_vol=partition_label_vol,
+        root_partition_labels=root_partition_labels,
+        volume_segment_guard=volume_bundle is not None,
+        volume_bounds=(origin, expected_max) if volume_bundle is not None else None,
         root_collision_ramp_steps=args.rk4_root_collision_ramp_steps,
         root_collision_start_distance=(
             args.rk4_root_collision_start_distance
@@ -4418,7 +5024,32 @@ def main():
             f"hard_steps={args.front_parting_surface_hard_steps}, "
             f"target={args.front_parting_surface_distance:.4f}m"
         )
+    if volume_bundle is not None:
+        from lib.recon_strategy.volume_segment_guard import audit_volume_strands
+        np.savez_compressed(os.path.join(out_dir, "final_strands_candidate.npz"),
+                            strands=strands, root_labels=root_partition_labels.cpu().numpy())
+        final_audit = audit_volume_strands(
+            strands, root_partition_labels.cpu().numpy(), partition_volume_np,
+            b_min_val, b_max_val,
+        )
+        with open(os.path.join(out_dir, "final_volume_audit.json"), "w") as stream:
+            json.dump(final_audit, stream, indent=2)
+        if not final_audit["passed"]:
+            raise RuntimeError("Final volume audit failed; candidate retained, PLY not published")
     save_strands_with_mesh(strands, args.mesh_obj, out_ply, 0.3, is_eval=False)
+    if volume_bundle is not None:
+        exported = o3d.io.read_line_set(out_ply)
+        exported_points = np.asarray(exported.points)
+        if exported_points.shape != (strands.shape[0] * strands.shape[1], 3):
+            raise RuntimeError("Export changed strand count; refusing silent filtering")
+        exported_audit = audit_volume_strands(
+            exported_points.reshape(strands.shape), root_partition_labels.cpu().numpy(),
+            partition_volume_np, b_min_val, b_max_val,
+        )
+        with open(os.path.join(out_dir, "exported_volume_audit.json"), "w") as stream:
+            json.dump(exported_audit, stream, indent=2)
+        if not exported_audit["passed"]:
+            raise RuntimeError("Serialized PLY volume audit failed")
 
     if args.export_per_view:
         print("\nStep 8: Exporting independent per-view strands...")

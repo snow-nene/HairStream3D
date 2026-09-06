@@ -130,7 +130,7 @@ dmypy.json
 #
 checkpoints/
 external/
-# results/# pixi environments
+# pixi environments
 .pixi/*
 !.pixi/config.toml
 results/
@@ -146,8 +146,25 @@ tests/*
 !tests/test_pde_domain_guard.py
 !tests/test_front_parting.py
 !tests/test_parting_root_attachment.py
+!tests/test_strand_depth_partition_audit.py
+!tests/test_partitioned_weighted_poisson.py
 !tests/test_parting_topology_smoke.py
 !tests/test_nearest_root_postprocess.py
+!tests/test_parting_groom_layer.py
+!tests/test_rk4_partition_invariant.py
+!tests/test_volume_partition_integration.py
+!tests/test_volume_partition_contracts.py
+!tests/test_volume_adaptive_direction.py
+!tests/test_mesh_visible_seeds.py
+!tests/test_volume_canonical_bounds.py
+!tests/test_volume_root_connection.py
+!tests/test_volume_head_visibility.py
+!tests/test_observation_contract.py
+!tests/test_observation_generation.py
+!tests/test_head_guard_comparison.py
+!tests/test_boundary_recovery.py
+!tests/test_typed_hair_geometry.py
+!tests/test_template_head_fit.py
 
 # AI agents and extensions
 .agent/

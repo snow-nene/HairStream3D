@@ -270,6 +270,28 @@ flowchart TB
 
 ## ✍️ 下一阶段落地顺序
 
+### 2026-08-29 局部 groom 实验的新结论
+
+`add-local-parting-groom-layer` 变更对 v30 做了四轮隔离实验。最重要的新发现不是 PDE 权重，而是发缝曲线的**可见面归属错误**：v28–v30 的 `front_parting_scalp_curve.npz` 在重建坐标中的 `z` 范围为 `-118～-41 mm`，转换到 front 相机后位于同像素头模深度分布的远侧。layer-only 渲染中，这些根段几乎全部被头模遮挡，说明所谓 front raycast 实际命中了后表面。
+
+早期 v24 曲线的 `z` 范围为 `-55～79 mm`，从前额可见侧延伸到冠部。用它重建拓扑后，layer-only 发束首次在正面完整可见，并形成左右分流。这一对照把“后表面误命中”确定为 v28–v30 发缝长期不可见的重要原因。
+
+| 实验 | 曲线/约束 | 30 mm 开口比 | 穿模点 | 正面观察 |
+| --- | --- | ---: | ---: | --- |
+| `smoke_v1` | v30 后侧曲线、无净空 | `1.126` | 未门禁 | 几乎完全被头模遮挡 |
+| `smoke_v2_surface` | v30 后侧曲线、表面净空 | `1.177` | `0` | 仍不可见，证明不是单纯穿模 |
+| `smoke_v3_visible_curve` | v24 可见侧曲线、顺序投影 | `2.284` | `16` | 正面可见并形成分流，但未通过门禁 |
+| `smoke_v4_visible_alternating` | v24 可见侧曲线、交替投影 | `1.609` | `0` | 几何继续改善，仍缺完整导向覆盖 |
+
+这组结果同时否定了“只向 v30 追加少量发束即可修复”的假设。v30 在可见发缝沿线缺少足量、连续且同侧的导向发束；唯一匹配会造成局部无导向或远距离交接，v4 的根部两岸覆盖率仅为 `43.75%`。下一阶段必须先修复 front raycast 的近表面选择，并对可见发缝选区内的原发束执行重定向或替换；不能继续在错误的后侧曲线上调 corridor、side penalty 或追加密度。
+
+对应证据保存在：
+
+- `results/multiview_data/0d285f5be7fa09c3dbbf1c9334047888/pde_governance/parting_groom_layer_smoke_v2_surface/`
+- `results/multiview_data/0d285f5be7fa09c3dbbf1c9334047888/pde_governance/parting_topology_full_visible_v24_curve/`
+- `results/multiview_data/0d285f5be7fa09c3dbbf1c9334047888/pde_governance/parting_groom_layer_smoke_v3_visible_curve/`
+- `results/multiview_data/0d285f5be7fa09c3dbbf1c9334047888/pde_governance/parting_groom_layer_smoke_v4_visible_alternating/`
+
 1. 为方案 A 建立独立 change，先实现通用的 scalp cut graph 与侧别标签，不接主重建入口
 2. 在 `tests/` 添加 S0–S3 的小型合成冒烟；测试输出统一进入 `tests/outputs/`
 3. 通过硬断言后，把切向表面 PDE 提升为根部薄层边界，并复用现有 screened-Poisson

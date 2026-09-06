@@ -40,6 +40,9 @@ from tqdm import tqdm
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, ROOT)
 
+from lib.multiview_observation import (
+    file_identity, write_observation_manifest, selected_map_views, generation_source,
+)
 from lib.options import BaseOptions
 from lib.model.img2hairstep.model_factory import create_img2strand_model
 from lib.model.img2hairstep.hourglass import Model as DepthModel
@@ -349,6 +352,29 @@ def main():
                         choices=["largest", "all"],
                         help="largest=综合评分选择主人物及其头发; all=所有人")
     args = parser.parse_args()
+    all_requested_views = selected_map_views(args.views)
+    args.views = [v for v in all_requested_views if v != 'front']
+    # Fail before writing maps if any requested generated source is missing.
+    generated_inputs = {}
+    for view in args.views:
+        options = [os.path.join(args.render_dir, f'{view}.png'),
+                   os.path.join(args.render_dir, f'{view}_hair.png')]
+        generated_inputs[view] = next((p for p in options if os.path.isfile(p)), None)
+        if generated_inputs[view] is None:
+            parser.error(f'Missing requested generated view: {view}')
+    if args.front_depth and not os.path.isfile(args.front_depth):
+        parser.error('Requested front depth does not exist')
+    original_identity = file_identity(args.front_img)
+    generation_sources = {view: generation_source(args.render_dir,view,path,original_identity)
+                          for view,path in generated_inputs.items()}
+    manifest_path = os.path.join(args.out_dir, 'observation_manifest.json')
+    manifest = {'version': 1, 'status': 'building', 'requested_views': all_requested_views,
+                'pipeline': 'FLUX -> existing HairStep inference; original front kept separately',
+                'original_front': original_identity, 'config': vars(args).copy(),
+                'models': {'strand': file_identity(args.checkpoint_img2strand),
+                           'depth': file_identity(args.checkpoint_img2depth)},
+                'observations': {}}
+    write_observation_manifest(manifest_path, manifest)
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
@@ -451,6 +477,18 @@ def main():
     np.save(os.path.join(out_depth, "front.npy"), front_depth)
     depth2vis(front_hair_mask, front_depth, os.path.join(out_depth_vis, "front.png"))
     print(f"  depth_map: {front_depth.shape}")
+    manifest['observations']['front'] = {
+        'source_kind': 'original', 'source_group': 'original:'+original_identity['sha256'],
+        'image': original_identity,
+        'derivation': {'strand': 'provided front map; red validity cleaned and resized if needed',
+                       'strand_input': file_identity(args.front_strand),
+                       'depth': 'provided' if args.front_depth else 'HairStep inference',
+                       'depth_input': file_identity(args.front_depth) if args.front_depth else None},
+        'products': {'strand_map': file_identity(os.path.join(out_strand,'front.png')),
+                     'depth_map': file_identity(os.path.join(out_depth,'front.npy')),
+                     'seg': file_identity(os.path.join(out_seg,'front.png'))}}
+    write_observation_manifest(manifest_path, manifest)
+
 
     # ================================================================
     #  2.  LEFT / RIGHT / BACK: SAM mask → strand → depth
@@ -495,6 +533,17 @@ def main():
         np.save(os.path.join(out_depth, f"{view}.npy"), depth_norm)
         depth2vis(hair_mask, depth_norm, os.path.join(out_depth_vis, f"{view}.png"))
         print(f"    depth_map: {depth_norm.shape}")
+        manifest['observations'][view] = {
+            'source_kind': 'generated', 'source_group': generation_sources[view]['source_group'],
+            'generation': generation_sources[view],
+            'image': file_identity(img_path),
+            'derivation': {'strand': 'HairStep inference', 'depth': 'HairStep inference',
+                           'generation_provenance': generation_sources[view]['status']},
+            'products': {'strand_map': file_identity(os.path.join(out_strand,f'{view}.png')),
+                         'depth_map': file_identity(os.path.join(out_depth,f'{view}.npy')),
+                         'seg': file_identity(os.path.join(out_seg,f'{view}.png'))}}
+        write_observation_manifest(manifest_path, manifest)
+
 
     # ================================================================
     #  3.  Combine into multi-view arrays
@@ -529,6 +578,10 @@ def main():
         print(f"  combined_depth: {d.shape}")
 
     print(f"\nDone → {args.out_dir}/")
+
+
+    manifest['status'] = 'complete'
+    write_observation_manifest(manifest_path, manifest)
 
 
 if __name__ == "__main__":

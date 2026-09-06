@@ -38,6 +38,7 @@ class ScreenedPoissonMetrics:
     device: str
     dtype: str
     breakdown: Optional[str] = None
+    component_residuals: Optional[list[dict]] = None
 
     def to_dict(self) -> dict:
         """Return a JSON-serializable metrics dictionary."""
@@ -152,10 +153,11 @@ def _validate_anchored_components(
     domain: np.ndarray,
     dirichlet: np.ndarray,
     soft_weight: np.ndarray,
+    partition_labels: Optional[np.ndarray] = None,
 ) -> None:
     """Reject disconnected components without any PDE anchor."""
 
-    components, count = label(domain)
+    components, count = label_partition_components(domain, partition_labels)
     if count == 0:
         raise ValueError("PDE domain is empty")
     anchored = dirichlet | (soft_weight > 0.0)
@@ -176,6 +178,31 @@ def _validate_anchored_components(
     )
 
 
+def label_partition_components(
+    domain: np.ndarray,
+    partition_labels: Optional[np.ndarray] = None,
+) -> tuple[np.ndarray, int]:
+    """Label spatial components while treating partition changes as cuts."""
+
+    domain = np.asarray(domain, dtype=bool)
+    if partition_labels is None:
+        return label(domain)
+    partitions = np.asarray(partition_labels)
+    if partitions.shape != domain.shape:
+        raise ValueError("partition_labels must match domain_mask")
+    if np.any(domain & (partitions <= 0)):
+        raise ValueError("partition_labels must be positive inside domain_mask")
+
+    components = np.zeros(domain.shape, dtype=np.int32)
+    component_count = 0
+    for partition_id in np.unique(partitions[domain]):
+        local, local_count = label(domain & (partitions == partition_id))
+        active = local > 0
+        components[active] = local[active] + component_count
+        component_count += int(local_count)
+    return components, component_count
+
+
 def solve_weighted_screened_poisson(
     domain_mask: np.ndarray,
     dirichlet_values: np.ndarray,
@@ -185,6 +212,8 @@ def solve_weighted_screened_poisson(
     soft_weight: Optional[np.ndarray] = None,
     normal_penalty_normals: Optional[np.ndarray] = None,
     normal_penalty_weight: Optional[np.ndarray] = None,
+    partition_labels: Optional[np.ndarray] = None,
+    require_component_convergence: bool = False,
     spacing: Sequence[float] = (1.0, 1.0, 1.0),
     diffusion: float = 1.0,
     tolerance: float = 1e-4,
@@ -205,6 +234,8 @@ def solve_weighted_screened_poisson(
         normal_penalty_normals: Optional unit normals shaped ``(3, X, Y, Z)``.
         normal_penalty_weight: Optional non-negative weights for the energy
             ``weight * (normal dot field)^2``.
+        partition_labels: Optional positive integer labels on the PDE domain.
+            Neighbor pairs with different labels have zero diffusion coupling.
         spacing: Physical voxel spacing for X, Y and Z.
         diffusion: Positive spatial smoothness coefficient.
         tolerance: Relative residual convergence threshold.
@@ -234,6 +265,17 @@ def solve_weighted_screened_poisson(
         raise ValueError("Dirichlet voxels must be inside the PDE domain")
     if not boundary_np.any():
         raise ValueError("At least one Dirichlet voxel is required")
+    partition_np = None
+    if partition_labels is not None:
+        partition_np = np.asarray(partition_labels)
+        if partition_np.shape != domain_np.shape:
+            raise ValueError("partition_labels must match domain_mask")
+        if not np.all(np.isfinite(partition_np)):
+            raise ValueError("partition_labels must be finite")
+        if np.any(domain_np & (partition_np <= 0)):
+            raise ValueError(
+                "partition_labels must be positive inside domain_mask"
+            )
     if diffusion <= 0.0:
         raise ValueError("diffusion must be positive")
     if tolerance <= 0.0:
@@ -288,6 +330,7 @@ def solve_weighted_screened_poisson(
             domain_np,
             boundary_np,
             soft_weight_np,
+            partition_np,
         )
 
     solve_device = torch.device(
@@ -295,6 +338,10 @@ def solve_weighted_screened_poisson(
         else ("cuda" if torch.cuda.is_available() else "cpu")
     )
     domain = _as_tensor(domain_np, device=solve_device, dtype=torch.bool)
+    partitions = (
+        _as_tensor(partition_np, device=solve_device, dtype=torch.int64)
+        if partition_np is not None else None
+    )
     boundary = _as_tensor(boundary_np, device=solve_device, dtype=torch.bool)
     unknown = domain & ~boundary
     boundary_values = _as_tensor(values_np, device=solve_device, dtype=dtype)
@@ -324,6 +371,8 @@ def solve_weighted_screened_poisson(
         lower = tuple(lower)
         upper = tuple(upper)
         pair = domain[lower] & domain[upper]
+        if partitions is not None:
+            pair &= partitions[lower] == partitions[upper]
         diagonal[lower] += coefficient * pair
         diagonal[upper] += coefficient * pair
     component_diagonal = diagonal.unsqueeze(0) + (
@@ -346,6 +395,8 @@ def solve_weighted_screened_poisson(
             lower = tuple(lower)
             upper = tuple(upper)
             pair = domain[lower] & domain[upper]
+            if partitions is not None:
+                pair &= partitions[lower] == partitions[upper]
             difference = (vector[(slice(None), *lower)]
                           - vector[(slice(None), *upper)])
             flux = coefficient * difference * pair.unsqueeze(0)
@@ -423,6 +474,30 @@ def solve_weighted_screened_poisson(
     if converged:
         breakdown = None
 
+    component_metrics = None
+    if require_component_convergence:
+        component_labels, component_count = label_partition_components(domain_np, partition_np)
+        component_metrics = []
+        residual_np = residual.detach().cpu().numpy()
+        rhs_np = rhs.detach().cpu().numpy()
+        for component_id in range(1, component_count + 1):
+            selected = (component_labels == component_id) & ~boundary_np
+            rhs_length = float(np.linalg.norm(rhs_np[:, selected].astype(np.float64)))
+            residual_length = float(np.linalg.norm(residual_np[:, selected].astype(np.float64)))
+            relative_component = residual_length / rhs_length if rhs_length > 0 else None
+            absolute_tolerance = float(tolerance)
+            passed = (relative_component <= tolerance if rhs_length > 0
+                      else residual_length <= absolute_tolerance)
+            component_metrics.append({
+                "component_id": component_id, "unknown_voxels": int(selected.sum()),
+                "rhs_norm": rhs_length, "absolute_residual": residual_length,
+                "relative_residual": relative_component,
+                "zero_rhs_absolute_tolerance": absolute_tolerance, "converged": bool(passed),
+            })
+        converged = converged and all(item["converged"] for item in component_metrics)
+        if not converged and breakdown is None:
+            breakdown = "component_residual_gate_failed"
+
     field = solution + boundary_values
     field *= domain.unsqueeze(0)
     if boundary.any():
@@ -448,5 +523,6 @@ def solve_weighted_screened_poisson(
         device=str(solve_device),
         dtype=str(dtype).replace("torch.", ""),
         breakdown=breakdown,
+        component_residuals=component_metrics,
     )
     return field_np, metrics

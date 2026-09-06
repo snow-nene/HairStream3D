@@ -30,6 +30,12 @@ if os.path.realpath(sys.executable) != os.path.realpath(_RECHANNEL_PYTHON):
         )
 
 import argparse
+import hashlib
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from lib.multiview_observation import (
+    file_identity, write_observation_manifest, selected_map_views,
+)
 import torch
 import numpy as np
 from PIL import Image, ImageDraw
@@ -99,12 +105,35 @@ def main():
                         help="Output size (default: 1024)")
     parser.add_argument("--model", type=str, default=MODEL_PATH,
                         help="Path to FLUX.2-klein model")
+    parser.add_argument('--original-front', default=None,
+                        help='Original photograph; otherwise use the unique raw_img image in the image directory')
+    parser.add_argument('--seed', type=int, default=42,
+                        help='Stable per-view generation seed, independent of view order')
     args = parser.parse_args()
+    selected_map_views(args.views)  # Validate names/duplicates without adding front.
+
 
     data_dir = os.path.join("results", "multiview_data", args.img_id)
     render_dir = os.path.join(data_dir, "blender_renders")
     out_dir = os.path.join(data_dir, "flux_redrawn")
     os.makedirs(out_dir, exist_ok=True)
+    for view in args.views:
+        if not os.path.isfile(os.path.join(render_dir, f'{view}.png')):
+            parser.error(f'Missing requested render: {view}')
+    manifest_path = os.path.join(out_dir, 'generation_manifest.json')
+    originals = [Path(args.original_front)] if args.original_front else [
+        p for p in Path(data_dir).glob('raw_img.*') if p.suffix.lower() in ('.png','.jpg','.jpeg','.webp')]
+    if len(originals) != 1:
+        parser.error('Specify --original-front when the original image is missing or ambiguous')
+    original = file_identity(originals[0])
+    manifest = {'version': 1, 'status': 'building', 'original_front': original,
+                'source_group': 'flux:'+original['sha256'], 'requested_views': args.views,
+                'model_path': str(Path(args.model).resolve()), 'config': vars(args).copy(),
+                'model_identity_scope': 'path and config files; weights are not content-verified',
+                'model_configs': [file_identity(p) for p in sorted(Path(args.model).glob('*.json'))],
+                'observations': {}}
+    write_observation_manifest(manifest_path, manifest)
+
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype = torch.float16
@@ -130,6 +159,7 @@ def main():
               f"(strength={args.strength}, steps={args.steps}) ...")
         mask = Image.new("L", (args.size, args.size), 255)
 
+        view_seed = (args.seed + int(hashlib.sha256(view.encode()).hexdigest()[:8],16)) % (2**31)
         with torch.no_grad():
             result = pipe(
                 prompt=prompt,
@@ -137,11 +167,18 @@ def main():
                 mask_image=mask,
                 strength=args.strength,
                 num_inference_steps=args.steps,
+                generator=torch.Generator(device=device).manual_seed(view_seed),
             ).images[0]
 
         out_path = os.path.join(out_dir, f"{view}.png")
         result.save(out_path)
         print(f"    Saved {out_path}")
+        manifest['observations'][view] = {'source_kind': 'generated',
+            'source_group': manifest['source_group'], 'seed': view_seed, 'prompt': prompt,
+            'render': file_identity(os.path.join(render_dir,f'{view}.png')),
+            'image': file_identity(out_path)}
+        write_observation_manifest(manifest_path, manifest)
+
 
     # ── Composite grid ───────────────────────────────────────────
     if len(loaded_views) >= 3:
@@ -158,6 +195,8 @@ def main():
             grid.save(grid_path)
             print(f"  Saved {grid_path}")
 
+    manifest['status'] = 'complete'
+    write_observation_manifest(manifest_path, manifest)
     print(f"Done — {len(loaded_views)} views saved to {out_dir}")
     print(f"Tip: lower --strength (e.g. 0.4) = keep hair closer to original")
     print(f"     higher --strength (e.g. 0.9) = more texture regeneration")
