@@ -13,6 +13,7 @@
 | 观测来源、坐标与有效性契约 | [输入契约](OBSERVATION_INPUT_CONTRACT.md) |
 | 体积分区实现及验收证据 | [实现状态](VOLUME_PARTITION_IMPLEMENTATION_STATUS.md)、[验收报告](VOLUME_PARTITION_ACCEPTANCE_REPORT.md) |
 | HairLRM 参考与迁移条件 | [参考材料](HairLRM.md)、[迁移验收](HAIRLRM_MIGRATION_ACCEPTANCE.md) |
+| 本次管线与 OpenSpec 整理 | [整理记录](PIPELINE_CLEANUP_20260906.md) |
 | 发缝方案与历史设计 | [拓扑方案](PDE_PARTING_TOPOLOGY_SOLUTIONS_AND_SMOKE_PLAN.md)、[连接场计划](PARTING_CONNECTION_LAPLACE_BELTRAMI_PLAN.md) |
 | 组会材料 | [Markdown 原稿](组会汇报_发缝建模_step1_step10.md)、[LaTeX 源稿](组会汇报_发缝建模_step1_step10.tex) |
 
@@ -23,12 +24,12 @@
 | 阶段 | 入口 | 说明 |
 | --- | --- | --- |
 | 多视图观测 | `scripts/infer_2d/flux_redraw_multiview.py`、`scripts/render/compute_multiview_maps.py` | 保留原始正面图及来源信息，按需选择视角 |
-| 分区与 PDE | `scripts/recon_3d/run_pde_multiview.py`、`build_volume_partition_bundle.py`、`run_volume_partition_smoke.py` | 核心实现在 `lib/multiview_pde.py` 和 `lib/recon_strategy/` |
+| 分区与 PDE | `scripts/recon_3d/run_pde_multiview.py`、`build_volume_partition_bundle.py`、`run_volume_partition_smoke.py` | 核心实现在 `lib/multiview_pde.py` 和 `lib/recon_strategy/`；`scripts/run_pipeline.sh` 默认要求 governed bundle，旧路径必须显式使用 `--legacy-pde` |
 | 积分对照 | `scripts/recon_3d/compare_head_guard_integration.py` | 同批根点、头部约束、逐步归因 |
 | 恢复与反馈实验 | `scripts/recon_3d/recover_boundary_strands.py`、`optimize_typed_hair_geometry.py` | 独立输出，实验约束见对应报告 |
 | 模板适配 | `scripts/render/export_template_head.py` → `scripts/recon_3d/fit_strands_to_template_head.py` | 导出实际渲染头模，再约束发丝间隙 |
 | 全前缀渲染 | `scripts/render/render_all_prefixes.py` | 默认要求输入绑定当前 `assets/render_template.blend`；支持 front、left、right、back 任意组合 |
-| 审计 | `scripts/vis/audit_*.py`、`scripts/recon_3d/audit_*.py` | 历史报告依赖的诊断入口保留原路径 |
+| 审计 | `scripts/vis/audit_*.py`、`scripts/recon_3d/audit_*.py` | 历史报告依赖的诊断入口保留原路径；早期头模和 Alpha Wrap 实验位于 `scripts/recon_3d/historical/` |
 
 ```mermaid
 flowchart LR

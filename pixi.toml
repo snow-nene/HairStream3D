@@ -45,9 +45,12 @@ taichi = ">=1.7.4, <2"
 pytest = ">=9.1.1, <10"
 
 [tasks]
-# 默认回归测试（硬编码常用测试图 0a1ba3dbefc8934ab60577c5c91f66a0，无需输入任何参数）
-test = "bash scripts/run_pipeline.sh --img_id 0a1ba3dbefc8934ab60577c5c91f66a0"
-test-front = "bash scripts/run_pipeline.sh --views front --img_id 0a1ba3dbefc8934ab60577c5c91f66a0"
+# 默认回归测试只运行版本化单元/集成测试，不隐式启动完整重建。
+test = "pytest -q tests"
+
+# 样例流水线单独命名，避免把昂贵的图像处理误当作测试。
+pipeline-sample = "bash scripts/run_pipeline.sh --img_id 0a1ba3dbefc8934ab60577c5c91f66a0"
+pipeline-sample-front = "bash scripts/run_pipeline.sh --views front --img_id 0a1ba3dbefc8934ab60577c5c91f66a0"
 
 # 通用流水线命令（支持传入自定义图片路径或 ID）
 pipeline = "bash scripts/run_pipeline.sh"
@@ -64,4 +67,3 @@ compute-maps = "python scripts/render/compute_multiview_maps.py"
 # 标定与可视化
 opt-cam = "python scripts/utils/opt_cam.py"
 vis-align = "python scripts/utils/vis_calib_alignment.py"
-

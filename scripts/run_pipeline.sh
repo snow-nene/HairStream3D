@@ -27,6 +27,8 @@ IMG_ID=""
 RAW_IMG=""
 STAGES=()
 VIEWS=("front" "left" "right" "back")
+PDE_MODE="governed"
+VOLUME_PARTITION_BUNDLE=""
 
 # 参数解析
 POSITIONAL_ARGS=()
@@ -34,6 +36,9 @@ while [[ "$#" -gt 0 ]]; do
     case $1 in
         --img_id) IMG_ID="$2"; shift ;;
         --raw_img) RAW_IMG="$2"; shift ;;
+        --pde-mode) PDE_MODE="$2"; shift ;;
+        --volume-partition-bundle) VOLUME_PARTITION_BUNDLE="$2"; shift ;;
+        --legacy-pde) PDE_MODE="legacy" ;;
         --views)
             shift
             VIEWS=()
@@ -97,6 +102,11 @@ fi
 if [ -z "$IMG_ID" ]; then
     echo "错误: 必须提供 --img_id 参数 (或提供 --raw_img 图片路径)。"
     echo "用法: $0 --img_id <id> [--raw_img <path>] [--views front left ...] [--stages stage1 ...]"
+    exit 1
+fi
+
+if [ "$PDE_MODE" != "governed" ] && [ "$PDE_MODE" != "legacy" ]; then
+    echo "错误: --pde-mode 只能是 governed 或 legacy。"
     exit 1
 fi
 
@@ -380,8 +390,25 @@ if run_stage "pde"; then
         "--pde_resolution" "384"
         "--pde_dilation_iters" "25"
         "--mesh_obj" "${DATA_DIR}/pixal3d/hair_mesh_aligned_best.obj"
-        "--export-per-view"
     )
+
+    if [ "$PDE_MODE" = "governed" ]; then
+        if [ -z "$VOLUME_PARTITION_BUNDLE" ]; then
+            VOLUME_PARTITION_BUNDLE="${DATA_DIR}/pde_governance/volume_partition_integration/volume_partition_bundle.npz"
+        fi
+        if [ ! -f "$VOLUME_PARTITION_BUNDLE" ]; then
+            echo "错误: governed PDE 需要可验证的体积分区 bundle。"
+            echo "       未找到: $VOLUME_PARTITION_BUNDLE"
+            echo "       请先运行 build_volume_partition_bundle.py，或显式使用 --legacy-pde。"
+            exit 2
+        fi
+        PDE_ARGS+=(
+            "--pde_solver_mode" "screened_poisson"
+            "--volume_partition_bundle" "$VOLUME_PARTITION_BUNDLE"
+        )
+    else
+        PDE_ARGS+=("--pde_solver_mode" "legacy_smooth" "--export-per-view")
+    fi
     
     # 如果包含侧视角，开启多视角扩展
     OTHER_VIEWS_COUNT=0
@@ -402,7 +429,11 @@ if run_stage "preview"; then
     echo "=================================================="
     echo " [6/6] Preview: 渲染最终 3D 毛发预览图"
     echo "=================================================="
-    # 假设 PDE 输出保存在 pde_reconstruction/hair_multiview.ply
+    if [ "$PDE_MODE" = "governed" ]; then
+        echo "  [INFO] governed PDE 不直接渲染未绑定发丝。请先完成模板头模适配，再调用 render_all_prefixes.py。"
+        exit 0
+    fi
+    # legacy PDE 输出保存在 pde_reconstruction/hair_multiview.ply
     PLY_PATH="${DATA_DIR}/pde_reconstruction/hair_multiview.ply"
     if [ ! -f "$PLY_PATH" ]; then
         echo "警告: 未找到 $PLY_PATH，跳过预览阶段。"
