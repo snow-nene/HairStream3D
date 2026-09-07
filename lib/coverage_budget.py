@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import numpy as np
+from scipy.spatial import cKDTree
 
 
 def allocate_coverage_roots(candidates, candidate_partition, candidate_visible, existing_points,
@@ -17,19 +18,25 @@ def allocate_coverage_roots(candidates, candidate_partition, candidate_visible, 
         raise ValueError("budget and min_distance must be non-negative")
     valid = np.isfinite(points).all(1) & (labels > 0) & visible
     if len(existing):
-        valid &= np.min(np.linalg.norm(points[:, None] - existing[None], axis=2), axis=1) >= float(min_distance)
+        if not np.isfinite(existing).all():
+            raise ValueError("existing points must be finite")
+        distances = np.full(len(points), -np.inf)
+        distances[valid] = cKDTree(existing).query(points[valid])[0]
+        valid &= distances >= float(min_distance)
     pool = np.flatnonzero(valid)
     rng = np.random.default_rng(seed)
     # Round-robin partitions prevents a large visible zone from consuming all budget.
     selected = []
-    for label in sorted(np.unique(labels[pool]).tolist()):
-        ids = pool[labels[pool] == label]
-        if len(ids):
-            selected.append(int(ids[0]))
-    remaining = np.setdiff1d(pool, np.asarray(selected, int), assume_unique=False)
-    if len(selected) < budget and len(remaining):
-        remaining = rng.permutation(remaining)[: int(budget) - len(selected)]
-        selected.extend(int(i) for i in remaining)
+    queues = [list(rng.permutation(pool[labels[pool] == label]))
+              for label in sorted(np.unique(labels[pool]).tolist())]
+    while len(selected) < budget and any(queues):
+        for queue in queues:
+            while queue and len(selected) < budget:
+                candidate = int(queue.pop())
+                if selected and np.any(np.linalg.norm(points[selected] - points[candidate], axis=1) < min_distance):
+                    continue
+                selected.append(candidate)
+                break
     selected = np.asarray(selected[: int(budget)], int)
     return {"indices": selected, "points": points[selected], "partitions": labels[selected],
             "candidate_count": int(len(pool)), "existing_count": int(len(existing)),
@@ -45,5 +52,5 @@ def coverage_gain(selected_points, target_points, radius):
         return 0.0
     if not len(selected):
         return 0.0
-    covered = np.min(np.linalg.norm(target[:, None] - selected[None], axis=2), axis=1) <= radius
+    covered = cKDTree(selected).query(target)[0] <= radius
     return float(np.mean(covered))
