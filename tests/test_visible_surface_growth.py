@@ -35,13 +35,53 @@ def test_whole_chord_and_single_point_collision_fail():
     assert chart.audit(np.array([[0., 0, .03], [.005, 0, .03]]))['passed']
 
 
-def test_surface_query_keeps_same_chart_partition():
+def test_surface_query_ignores_soft_partition_seams():
     chart = make_chart()
     point = np.array([0., 0, .0208])
+    chart.labels[32, 32] = 2
     direction, reason = chart.query(point, 1)
     assert reason is None
     assert direction[1] > 0
-    assert chart.query(point, 2)[1] == 'view_partition_boundary'
+    assert chart.query(point, 2)[1] is None
+
+
+def test_semantic_exit_is_distinct_from_soft_or_unassigned_partition():
+    chart = make_chart()
+    start, end = np.array([-.01, 0, .03]), np.array([.01, 0, .03])
+    chart.labels[:, 31:34] = 0
+    assert chart.guard(start, end, 1) is None
+    chart.hair_domain[:, 31:34] = False
+    assert chart.guard(start, end, 1) == 'hair_semantic_exit'
+
+
+def test_front_semantic_guard_allows_hidden_hair_but_blocks_visible_face():
+    from scripts.recon_3d.grow_visible_surface_gaps import guard_visible_photo_domain
+    chart = make_chart()
+    chart.hair_domain[31:34,31:34] = False
+    a, b = np.array([-.005,0,.03]), np.array([.005,0,.03])
+    assert guard_visible_photo_domain(a,b,chart) == 'front_visible_hair_semantic_exit'
+    a[2] = b[2] = -.03
+    assert guard_visible_photo_domain(a,b,chart) is None
+
+
+def test_front_guard_rejects_unoccluded_background_and_outside_image():
+    from scripts.recon_3d.grow_visible_surface_gaps import guard_visible_photo_domain
+    chart = make_chart()
+    chart.hair_domain[:] = False
+    assert guard_visible_photo_domain(np.array([.03, 0, 0]), np.array([.031, 0, 0]), chart) == 'front_visible_hair_semantic_exit'
+    assert guard_visible_photo_domain(np.array([.06, 0, 0]), np.array([.061, 0, 0]), chart) == 'front_image_exit'
+
+
+def test_semantic_boundary_correction_preserves_root_launch_normal():
+    mesh = o3d.geometry.TriangleMesh.create_sphere(radius=.02,resolution=20)
+    domain = np.ones((64,64),bool)
+    domain[:,33:] = False
+    chart = VisibleSurfaceGrowth(np.diag([20.,20.,20.,1.]),domain.astype(int),
+                                 np.zeros((64,64,2)),mesh,hair_domain=domain,contour_correction=True)
+    vector = np.array([1.,1.,.3])
+    corrected = chart.correct_semantic_direction(np.array([0.,0,.03]),vector,np.array([0.,0.,1.]))
+    assert corrected[0] <= 0
+    np.testing.assert_allclose(corrected[1:],vector[1:])
 
 
 def test_perspective_template_depth_occludes_back_surface():
@@ -125,7 +165,8 @@ def test_local_guides_preserve_horizontal_flow_and_reject_missing_region():
     direction, reason = field.query(np.array([0., .001, .03]), 1)
     assert reason is None
     np.testing.assert_allclose(direction, [1, 0, 0], atol=1e-6)
-    assert field.query(np.array([0., 0, .03]), 2)[1] == 'no_same_region_guides'
+    empty_field = LocalGuideField([], chart)
+    assert empty_field.query(np.array([0., 0, .03]), 1)[1] == 'no_same_region_guides'
     assert field.query(np.array([1., 0, .03]), 1)[1] == 'insufficient_local_guides'
 
 

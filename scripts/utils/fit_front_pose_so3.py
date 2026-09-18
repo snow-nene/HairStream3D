@@ -2,6 +2,7 @@
 """用合法 SO(3) 旋转拟合标准头模到真实 front 图像。"""
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
@@ -37,8 +38,8 @@ def project_landmarks(points, rotation, center, scale, ortho_ratio, image_size):
     ndc = camera[:, :2] * (float(scale) / float(ortho_ratio)) / 512.0
     ndc[:, 1] *= -1.0
     pixels = np.empty((len(points), 2), dtype=np.float64)
-    pixels[:, 0] = (ndc[:, 0] + 1.0) * 0.5 * image_size - 1.0
-    pixels[:, 1] = (ndc[:, 1] + 1.0) * 0.5 * image_size - 1.0
+    pixels[:, 0] = (ndc[:, 0] + 1.0) * 0.5 * (image_size - 1)
+    pixels[:, 1] = (ndc[:, 1] + 1.0) * 0.5 * (image_size - 1)
     return pixels
 
 
@@ -85,6 +86,8 @@ def main():
     parser.add_argument("--img_id", required=True)
     parser.add_argument("--image", default=None)
     parser.add_argument("--out_dir", default=None)
+    parser.add_argument('--holdout-stride', type=int, default=0,
+                        help='每隔N个关键点留出一个，仅用于本轮拟合的留出验证；0为全部拟合')
     args = parser.parse_args()
 
     data_dir = ROOT / "results" / "multiview_data" / args.img_id
@@ -118,6 +121,11 @@ def main():
     initial_center = np.asarray(old_param["center"], dtype=np.float64).reshape(3)
     initial_scale = float(np.asarray(old_param["scale"]).reshape(-1)[0])
     weights = landmark_weights(len(source))
+    holdout = np.zeros(len(source), bool)
+    if args.holdout_stride:
+        if args.holdout_stride < 2:
+            raise ValueError('holdout stride must be zero or >=2')
+        holdout[::args.holdout_stride] = True
 
     old_camera_depth = float(
         (initial_rotation @ initial_center.reshape(3, 1))[2, 0]
@@ -142,7 +150,7 @@ def main():
         predicted = project_landmarks(
             source, rotation, center, scale, ortho_ratio, 512
         )
-        return ((predicted - target) * np.sqrt(weights[:, None])).ravel()
+        return ((predicted - target) * np.sqrt(weights[:, None]))[~holdout].ravel()
 
     base_rotvec = Rotation.from_matrix(initial_rotation).as_rotvec()
     candidates = []
@@ -178,6 +186,19 @@ def main():
     cv2.imwrite(str(out_dir / "head_pose_overlay.png"), diagnostic)
 
     errors = np.linalg.norm(predicted - target, axis=1)
+    old_predicted = project_landmarks(source, old_param['R'],
+        np.asarray(old_param['center']).reshape(3), initial_scale, ortho_ratio, 512)
+    old_errors = np.linalg.norm(old_predicted-target, axis=1)
+    metrics = {'original_photo': str(image_path), 'holdout_stride': args.holdout_stride,
+        'landmark_source': 'TDDFA_original_photo_detection_not_manual_ground_truth',
+        'legacy_mean_px': float(old_errors.mean()), 'candidate_mean_px': float(errors.mean()),
+        'legacy_holdout_mean_px': float(old_errors[holdout].mean()) if holdout.any() else None,
+        'candidate_holdout_mean_px': float(errors[holdout].mean()) if holdout.any() else None,
+        'status': 'candidate_only_not_installed',
+        'limit': '仅留出本轮重拟合，旧标定可能已使用这些关键点；不能视为完全独立标定真值'}
+    (out_dir/'metrics.json').write_text(json.dumps(metrics, ensure_ascii=False, indent=2))
+    np.savez_compressed(out_dir/'landmarks.npz', source=source, target=target,
+                        predicted=predicted, legacy_predicted=old_predicted, holdout=holdout)
     report = (
         f"mean_error_px={errors.mean():.4f}\n"
         f"median_error_px={np.median(errors):.4f}\n"

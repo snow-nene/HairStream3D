@@ -28,6 +28,7 @@ pip = ">=26.1.2,<27"
 pytorch3d = ">=0.7.8,<0.8"
 
 [pypi-dependencies]
+accelerate = ">=1.10.0,<2"
 # 移除 torchvision（移到了上面的 [dependencies] 中）
 onnx = "==1.16.0"      
 segment-anything = ">=1.0"

@@ -38,7 +38,7 @@ def get_lmk(img_bgr, size=256):
     cfg = yaml.load(open('configs/mb1_120x120.yml'), Loader=yaml.SafeLoader)
     from TDDFA import TDDFA
     from FaceBoxes import FaceBoxes
-    tddfa      = TDDFA(gpu_mode=True, **cfg)
+    tddfa      = TDDFA(gpu_mode=torch.cuda.is_available(), **cfg)
     face_boxes = FaceBoxes()
     os.chdir(ROOT)
 

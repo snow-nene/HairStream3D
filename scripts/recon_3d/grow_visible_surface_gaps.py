@@ -10,6 +10,7 @@ import cv2
 import numpy as np
 import open3d as o3d
 from scipy.spatial import cKDTree
+from scipy.ndimage import distance_transform_edt
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from lib.coverage_budget import allocate_coverage_roots
@@ -36,14 +37,27 @@ def audit_strands(strands, mesh, spacing=.000125, clearance=.0004):
     scene = o3d.t.geometry.RaycastingScene()
     scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(mesh))
     inside, total, minimum = 0, 0, float('inf')
+    pending, pending_count = [], 0
+    def measure(points):
+        tensor = o3d.core.Tensor(points.astype(np.float32))
+        return (int(scene.compute_occupancy(tensor, nsamples=11).numpy().sum()),
+                float(scene.compute_distance(tensor).numpy().min()))
     for index, strand in enumerate(strands):
         if not len(strand) or not np.isfinite(strand).all():
             raise ValueError(f'invalid strand {index}')
         samples = sample_polyline(strand, spacing)
-        tensor = o3d.core.Tensor(samples.astype(np.float32))
-        inside += int(scene.compute_occupancy(tensor, nsamples=11).numpy().sum())
-        minimum = min(minimum, float(scene.compute_distance(tensor).numpy().min()))
+        pending.append(samples)
+        pending_count += len(samples)
         total += len(samples)
+        if pending_count >= 100000:
+            count, distance = measure(np.concatenate(pending))
+            inside += count
+            minimum = min(minimum, distance)
+            pending, pending_count = [], 0
+    if pending:
+        count, distance = measure(np.concatenate(pending))
+        inside += count
+        minimum = min(minimum, distance)
     return {'passed': bool(inside == 0 and minimum >= clearance and total > 0),
             'inside_points': inside, 'minimum_distance_m': minimum if total else None,
             'sampled_points': total, 'sample_spacing_m': spacing, 'clearance_m': clearance,
@@ -84,6 +98,22 @@ def guard_template_domain(start, end, coverage, allowed):
     return None
 
 
+def guard_visible_photo_domain(start, end, chart):
+    """原图约束所有未被头模遮挡的线段，包括头模轮廓外区域。"""
+    samples = sample_polyline(np.asarray([start, end]), .000125)
+    ids, depth, valid = chart.pixels(samples)
+    if not valid.all():
+        return 'front_image_exit'
+    ids, depth = ids[valid], depth[valid]
+    if not len(ids):
+        return None
+    x, y = ids.T
+    visible = ~chart.head_hit[y,x] | (depth >= chart.head_z[y,x] - 1e-5)
+    if np.any(visible & ~chart.hair_domain[y,x]):
+        return 'front_visible_hair_semantic_exit'
+    return None
+
+
 class LocalGuideField:
     """Reconstruct directed local tangents; never translate a donor trajectory.
 
@@ -118,6 +148,10 @@ class LocalGuideField:
             self.fields[int(label)] = (cKDTree(points[keep]), directions[keep])
 
     def query(self, point, partition):
+        ids, _, valid = self.chart.pixels(point[None])
+        active = int(self.chart.labels[ids[0, 1], ids[0, 0]]) if valid[0] else 0
+        if active > 0 and active in self.fields:
+            partition = active
         if partition not in self.fields:
             return np.zeros(3), 'no_same_region_guides'
         tree, directions = self.fields[partition]
@@ -140,7 +174,7 @@ class LocalGuideField:
             component = float(vector @ normal)
             outward = max(component, np.clip((self.chart.clearance-separation)/.004, 0, .5))
             vector += (outward-component)*normal
-        return vector, None
+        return self.chart.correct_semantic_direction(point, vector, normal), None
 
 
 def load_observation_camera(data_dir, view):
@@ -154,10 +188,19 @@ def load_observation_camera(data_dir, view):
 
 
 class VisibleSurfaceGrowth:
-    def __init__(self, camera, labels, axial, mesh, clearance=.0008):
+    def __init__(self, camera, labels, axial, mesh, clearance=.0008, hair_domain=None,
+                 contour_correction=False):
         self.camera = np.asarray(camera, float)
         self.inverse = np.linalg.inv(camera)
         self.labels, self.axial = labels, axial
+        self.contour_correction = contour_correction
+        self.hair_domain = np.asarray(hair_domain if hair_domain is not None else labels > 0, bool).copy()
+        if self.hair_domain.shape != labels.shape:
+            raise ValueError('hair domain must match labels')
+        padded = np.pad(self.hair_domain, 1)
+        self.semantic_distance = distance_transform_edt(padded)[1:-1,1:-1]
+        gy, gx = np.gradient(self.semantic_distance)
+        self.semantic_gradient = np.stack([gx,gy],-1)
         self.h, self.w = labels.shape
         self.clearance = clearance
         self.scene = o3d.t.geometry.RaycastingScene()
@@ -227,13 +270,38 @@ class VisibleSurfaceGrowth:
     def score(self, strands):
         return float(np.count_nonzero(self.covered(strands) & self.target) / max(1, self.target.sum()))
 
+    def correct_semantic_direction(self, point, vector, normal):
+        """在可见轮廓附近移除朝外分量，同时保留根部离开头皮的法向分量。"""
+        if not self.contour_correction:
+            return vector
+        ids, depth, valid = self.pixels(point[None])
+        if not valid[0]:
+            return vector
+        x,y = ids[0]
+        distance = self.semantic_distance[y,x]
+        if distance >= 4 or depth[0] < self.head_z[y,x]-1e-5:
+            return vector
+        clip = self.camera @ np.r_[point,1.]
+        jacobian = (self.camera[:2,:3]*clip[3] - clip[:2,None]*self.camera[3,:3])/clip[3]**2
+        jacobian *= np.array([self.w-1,self.h-1])[:,None]/2
+        inward = jacobian.T @ self.semantic_gradient[y,x]
+        inward -= normal * (inward @ normal)
+        norm = np.linalg.norm(inward)
+        if norm < 1e-8:
+            return vector
+        inward /= norm
+        component = vector @ inward
+        desired = .15 * (1-distance/4)
+        return vector + max(0.,desired-component)*inward
+
     def query(self, point, partition):
         ids, _, valid = self.pixels(point[None])
         if not valid[0]:
             return np.zeros(3), 'outside_image'
         x, y = ids[0]
-        if self.labels[y, x] != partition:
-            return np.zeros(3), 'view_partition_boundary'
+        active = int(self.labels[y, x])
+        if active > 0:
+            partition = active
         axial = self.axial[y, x]
         if np.linalg.norm(axial) < .5:
             return np.zeros(3), 'unknown_direction'
@@ -253,19 +321,21 @@ class VisibleSurfaceGrowth:
         tangent = base - ray * (normal @ base) / denom
         tangent /= max(np.linalg.norm(tangent), 1e-12)
         tangent += normal * np.clip((self.clearance - distance) / .002, -.25, .5)
-        return tangent, None
+        return self.correct_semantic_direction(point,tangent,normal), None
 
     def guard(self, start, end, partition):
         points = sample_polyline(np.array([start, end]), .000125)
-        ids, _, valid = self.pixels(points)
+        ids, depth, valid = self.pixels(points)
         if not valid.all():
             return 'outside_image'
-        if np.any(self.labels[ids[:, 1], ids[:, 0]] != partition):
-            return 'view_partition_boundary'
         closest = self.scene.compute_closest_points(o3d.core.Tensor(points.astype(np.float32)))
         distance = np.sum((points - closest['points'].numpy()) * closest['primitive_normals'].numpy(), axis=1)
         if np.any(distance < .00045):
             return 'head_clearance'
+        x, y = ids.T
+        visible = depth >= self.head_z[y, x] - 1e-5
+        if np.any(visible & ~self.hair_domain[y, x]):
+            return 'hair_semantic_exit'
         return None
 
     def audit(self, strand):
@@ -287,15 +357,27 @@ def main():
     parser.add_argument('--output-dir', type=Path, required=True)
     parser.add_argument('--view', choices=['front', 'left', 'right', 'back'], default='back')
     parser.add_argument('--budget', type=int, default=300)
-    parser.add_argument('--direction-mode', choices=['image_tangent', 'local_guides'], default='image_tangent')
+    parser.add_argument('--direction-mode', choices=['image_tangent', 'local_guides', 'hybrid', 'surface_solve'], default='hybrid')
+    parser.add_argument('--guide-support-m', type=float, default=.012,
+                        help='同候选区域 guide 的方向支持半径；仅插值方向，不复制轨迹')
+    parser.add_argument('--root-spacing-m', type=float, default=.0015,
+                        help='新增根与已有根及其他新根的最小间距')
+    parser.add_argument('--contour-correction', action='store_true',
+                        help='实验性可见轮廓方向修正；默认关闭，须用固定目标对照验证')
+    parser.add_argument('--surface-branch-selection',action='store_true',
+                        help='曲面场在每个根点试探两个根尖符号并选取可持续生长分支')
     parser.add_argument('--surface-offset-m', type=float, default=.0008,
                         help='根点仍为 0.8 mm 间隙，方向场逐渐向外达到该表面距离')
     parser.add_argument('--audit-only', action='store_true')
     parser.add_argument('--coverage-camera', type=Path,
                         help='实际模板视角相机；与方向证据视角分开')
     parser.add_argument('--visibility-render', type=Path,
-                        help='audit_visible_head_coverage 生成的同相机平色图，仅从红色露头模区域补根')
+                        help='可选历史平色图；仅用于限制生长包络，不作为头发输入真值')
     args = parser.parse_args()
+    if not np.isfinite(args.guide_support_m) or not 0 < args.guide_support_m <= .05:
+        raise ValueError('guide support must be positive and at most 50 mm')
+    if not np.isfinite(args.root_spacing_m) or args.root_spacing_m < .0006:
+        raise ValueError('root spacing must be at least 0.6 mm')
     if not np.isfinite(args.surface_offset_m) or not .0008 <= args.surface_offset_m <= .004:
         raise ValueError('surface offset must be between 0.8 and 4 mm')
     args.output_dir.mkdir(parents=True, exist_ok=False)
@@ -325,24 +407,57 @@ def main():
     edge, threshold = clean_candidate_edge(evidence['fused'], evidence['valid'], .97)
     labels, partition_report = partition_from_barrier(seg & evidence['valid'], edge)
     camera = load_observation_camera(args.data_dir, args.view)
-    chart = VisibleSurfaceGrowth(camera, labels, evidence['axial'], mesh, clearance=args.surface_offset_m)
+    chart = VisibleSurfaceGrowth(camera, labels, evidence['axial'], mesh,
+                                 clearance=args.surface_offset_m, hair_domain=seg,
+                                 contour_correction=args.contour_correction)
+    front_chart = chart
+    if args.view != 'front':
+        front_seg = cv2.imread(str(maps / 'seg' / 'front.png'), 0)
+        if front_seg is None:
+            raise ValueError('original front segmentation required for visible face guard')
+        front_seg = front_seg > 127
+        front_chart = VisibleSurfaceGrowth(load_observation_camera(args.data_dir, 'front'),
+            front_seg.astype(np.int32), np.zeros((*front_seg.shape,2)), mesh, hair_domain=front_seg)
     coverage = chart
+    fixed_surface_target = False
+    inferred_region_count = 0
     if args.coverage_camera:
         with np.load(args.coverage_camera) as data:
             require_bound_template(data, Path(identity['template_path']))
             shape = tuple(data['image_shape'])
             coverage = VisibleSurfaceGrowth(data['camera'], np.ones(shape, np.int32),
                                              np.zeros((*shape, 2)), mesh)
+            if 'target_mask' in data:
+                if data['target_mask'].shape != shape:
+                    raise ValueError('coverage target mask must match camera shape')
+                coverage.target &= data['target_mask'].astype(bool)
+                fixed_surface_target = True
         ids, _, valid = chart.pixels(coverage.head_points)
         transferred = np.zeros(len(ids), np.int32)
         transferred[valid] = labels[ids[valid, 1], ids[valid, 0]]
         coverage.labels = transferred.reshape(shape)
-        coverage.target &= coverage.labels > 0
+        if fixed_surface_target:
+            # A crown point can be hidden/outside the direction view's hair mask.
+            # Infer its candidate region only from nearby labelled guide roots.
+            root_points = np.asarray([s[0] for s in existing])
+            root_ids, _, root_valid = chart.pixels(root_points)
+            root_labels = np.zeros(len(root_points), np.int32)
+            root_labels[root_valid] = labels[root_ids[root_valid,1],root_ids[root_valid,0]]
+            supported = root_labels > 0
+            if supported.any():
+                distance, nearest = cKDTree(root_points[supported]).query(coverage.head_points)
+                infer = (transferred <= 0) & (distance <= args.guide_support_m) & coverage.target.ravel()
+                inferred_region_count = int(infer.sum())
+                transferred[infer] = root_labels[supported][nearest[infer]]
+                coverage.labels = transferred.reshape(shape)
+        elif not args.visibility_render:
+            coverage.target &= coverage.labels > 0
     covered = coverage.covered(existing)
     roots = np.asarray([s[0] for s in existing])
     candidates = coverage.head_points + .0008 * coverage.normals
     distances = cKDTree(roots).query(candidates)[0].reshape(coverage.target.shape)
-    eligible = coverage.target & ~covered & (distances < .015)
+    eligible = coverage.target & ~covered
+    remote_gap_count = int((eligible & (distances >= .015)).sum())
     allowed = None
     if args.visibility_render:
         if not args.coverage_camera:
@@ -350,15 +465,12 @@ def main():
         pixels = cv2.imread(str(args.visibility_render), cv2.IMREAD_COLOR)
         if pixels is None or pixels.shape[:2] != coverage.target.shape:
             raise ValueError('visibility render dimensions must match coverage camera')
-        exposed = (pixels[..., 2] > 127) & (pixels[..., 2] > pixels[..., 1])
         allowed = template_growth_domain(pixels)
         coverage.target &= allowed
         eligible &= allowed
-        eligible &= exposed
-        coverage.target &= exposed
         cv2.imwrite(str(args.output_dir / 'template_growth_domain.png'), allowed.astype(np.uint8) * 255)
     proposal = allocate_coverage_roots(candidates, coverage.labels.ravel(), eligible.ravel(), roots,
-                                       budget=args.budget, min_distance=.0015)
+                                       budget=args.budget, min_distance=args.root_spacing_m)
     print(json.dumps({'target_pixels': int(coverage.target.sum()), 'gap_pixels': int((coverage.target & ~covered).sum()),
                       'candidates': int(eligible.sum()), 'selected': len(proposal['indices'])}), flush=True)
     coverage_state = {'mask': coverage.covered(existing)}
@@ -369,13 +481,16 @@ def main():
         return float(np.count_nonzero(coverage.target.ravel() & candidate_mask & ~coverage_state['mask'].ravel()) / target_count)
     def coverage_commit(candidate):
         coverage_state['mask'].ravel()[coverage.mask(candidate)] = True
+    # Similar tips do not imply duplicate paths. Check novelty along the path.
+    existing_tree = cKDTree(np.concatenate([sample_polyline(p, .001) for p in existing]))
     def trajectory_quality(current, candidate):
-        endpoints = [p[-1] for p in current]
-        if not endpoints:
-            return True
-        return bool(cKDTree(np.asarray(endpoints)).query(candidate[-1])[0] >= .0035)
+        samples = sample_polyline(candidate, .001)
+        return bool(np.mean(existing_tree.query(samples)[0] >= .00075) >= .15)
 
     def guarded_segment(start, end, partition):
+        reason = guard_visible_photo_domain(start, end, front_chart)
+        if reason:
+            return reason
         if allowed is not None:
             reason = guard_template_domain(start, end, coverage, allowed)
             if reason:
@@ -383,27 +498,58 @@ def main():
         return chart.guard(start, end, partition)
 
     field_query = chart.query
-    if args.direction_mode == 'local_guides':
-        local_field = LocalGuideField(existing, chart)
+    surface_report = None
+    begin_trajectory = None
+    if args.direction_mode == 'surface_solve':
+        from lib.surface_guide_field import SurfaceGuideField
+        local_field = LocalGuideField(existing, chart, support_m=args.guide_support_m)
+        surface_field = SurfaceGuideField(mesh, local_field, chart, support_m=args.guide_support_m)
+        field_query = surface_field.query
+        surface_report = surface_field.report
+        if args.surface_branch_selection:
+            begin_trajectory = lambda root,partition: surface_field.begin_trajectory(root,partition,guarded_segment)
+        np.savez_compressed(args.output_dir/'surface_direction_field.npz',
+            vertices=surface_field.vertices, normals=surface_field.normals,
+            **{f'region_{label}':vectors for label,vectors in surface_field.fields.items()})
+        print(json.dumps({'surface_solve':surface_report}),flush=True)
+    if args.direction_mode in ('local_guides', 'hybrid'):
+        local_field = LocalGuideField(existing, chart, support_m=args.guide_support_m)
         field_query = local_field.query
+        if args.direction_mode == 'hybrid':
+            def field_query(point, partition):
+                direction, reason = local_field.query(point, partition)
+                if reason in ('insufficient_local_guides', 'no_same_region_guides'):
+                    return chart.query(point, partition)
+                return direction, reason
     result = execute_supplemental_growth({'roots': proposal}, query_field=field_query,
         check_segment=guarded_segment, audit_trajectory=chart.audit, coverage_score=coverage.score,
-        existing_strands=existing, step_m=.0005, length_m=.12, min_length_m=.025,
+        existing_strands=existing, step_m=.0005, length_m=.12, min_length_m=.015,
         coverage_delta=coverage_delta, coverage_commit=coverage_commit,
-        trajectory_quality=trajectory_quality)
+        trajectory_quality=trajectory_quality,begin_trajectory=begin_trajectory)
     extra = result.pop('strands')
+    if args.direction_mode == 'surface_solve':
+        result['surface_branch_counts']=surface_field.branch_counts
     after = coverage.covered(existing + extra)
     for name, mask in [('target', coverage.target), ('gap_before', coverage.target & ~covered),
                        ('gap_after', coverage.target & ~after), ('barrier', edge)]:
         cv2.imwrite(str(args.output_dir / f'{name}.png'), mask.astype(np.uint8) * 255)
-    result.update({'status': 'candidate_requires_multiview_render_validation', 'view': args.view,
-                   'partition_semantics': 'view_local_axial_depth_candidate_barriers_not_trusted_3d_parting',
+    result.update({'status': 'candidate_requires_fixed_multiview_validation', 'view': args.view,
+                   'partition_semantics': 'view_local_axial_depth_candidate_barriers_soft_seams_not_trusted_3d_parting',
                    'partition_report': partition_report, 'edge_threshold': threshold,
                    'template_identity': identity, 'input': str(args.input.resolve()),
                    'coverage_camera': str(args.coverage_camera),
                    'visibility_render': str(args.visibility_render),
                    'surface_offset_m': args.surface_offset_m,
                    'direction_mode': args.direction_mode,
+                   'surface_solve': surface_report,
+                   'surface_branch_selection':args.surface_branch_selection,
+                   'guide_support_m': args.guide_support_m,
+                   'root_spacing_m': args.root_spacing_m,
+                   'semantic_direction_correction': bool(args.contour_correction),
+                   'remote_gap_candidates_previously_excluded': remote_gap_count,
+                   'fixed_surface_target': fixed_surface_target,
+                   'nearby_guide_inferred_region_pixels': inferred_region_count,
+                   'unsupported_target_pixels': int((coverage.target & (coverage.labels <= 0)).sum()),
                    'target_pixels': int(coverage.target.sum()), 'gap_pixels_before': int((coverage.target & ~covered).sum()),
                    'gap_pixels_after': int((coverage.target & ~after).sum()),
                    'selection_metric': 'head_depth_tested_pixel_centres_proxy_not_blender_coverage',
@@ -415,6 +561,8 @@ def main():
     with np.load(args.input) as source:
         original = source['strands']
         sizes[:len(existing)] = source.get('valid_point_counts', np.full(len(existing), original.shape[1]))
+        supplemental = np.r_[source.get('is_supplemental', np.zeros(len(existing),bool)),
+                              np.ones(len(extra),bool)]
     padded = pack_supplemental_strands(original, extra)
     print('Auditing final packed existing and supplemental segments before export', flush=True)
     result['combined_collision_audit'] = audit_strands(padded, mesh)
@@ -423,7 +571,7 @@ def main():
         raise RuntimeError('combined independent collision audit blocked export')
     np.savez_compressed(args.output_dir / 'all_root_prefixes.npz', strands=padded,
         valid_point_counts=sizes, template_blend_sha256=np.array(identity['template_sha256']),
-        is_supplemental=np.arange(len(combined)) >= len(existing))
+        is_supplemental=supplemental)
     np.savez_compressed(args.output_dir / 'view_evidence.npz', labels=labels, camera=camera,
                         selected_candidate_indices=proposal['indices'], selected_roots=proposal['points'])
     (args.output_dir / 'report.json').write_text(json.dumps(result, indent=2))

@@ -43,7 +43,8 @@ def execute_supplemental_growth(plan, *, query_field, check_segment,
                                 audit_trajectory, coverage_score, existing_strands,
                                 step_m=.0005, length_m=.1, min_length_m=.01,
                                 coverage_delta=None, coverage_commit=None,
-                                trajectory_quality=None):
+                                trajectory_quality=None, begin_trajectory=None,
+                                commit_step=None, root_length_budget=None):
     """Integrate new roots without copying or attracting to guide positions.
 
     query_field(point, partition) returns a directed vector and a stop reason
@@ -53,6 +54,9 @@ def execute_supplemental_growth(plan, *, query_field, check_segment,
     coverage callback measures visible coverage for the complete strand set;
     only audited trajectories with positive marginal coverage are accepted.
     These callbacks must share world coordinates and the actual template.
+    commit_step runs only after both midpoint and full-step guards pass.
+    root_length_budget supplies a per-root budget within the configured
+    minimum and maximum lengths; omission retains the global budget.
     """
     if not (np.isfinite([step_m, length_m, min_length_m]).all()
             and step_m > 0 and length_m >= min_length_m > 0):
@@ -67,10 +71,15 @@ def execute_supplemental_growth(plan, *, query_field, check_segment,
                                         plan["roots"]["points"],
                                         plan["roots"]["partitions"]):
         point = np.asarray(root, float).copy()
+        if begin_trajectory is not None:
+            begin_trajectory(point.copy(),int(partition))
+        budget = float(root_length_budget(point, int(partition))) if root_length_budget is not None else length_m
+        if not np.isfinite(budget) or budget < min_length_m or budget > length_m:
+            raise ValueError('invalid per-root length budget')
         path = [point.copy()]
         reason = check_segment(point, point, int(partition))
         length = 0.
-        while reason is None and length < length_m - 1e-12:
+        while reason is None and length < budget - 1e-12:
             direction, reason = query_field(point, int(partition))
             direction = np.asarray(direction, float)
             if reason is not None:
@@ -79,7 +88,7 @@ def execute_supplemental_growth(plan, *, query_field, check_segment,
             if direction.shape != (3,) or not np.isfinite(direction).all() or norm < 1e-10:
                 reason = "zero_or_invalid_direction"
                 break
-            step = min(step_m, length_m - length)
+            step = min(step_m, budget - length)
             midpoint = point + .5 * step * direction / norm
             reason = check_segment(point, midpoint, int(partition))
             if reason is not None:
@@ -96,6 +105,8 @@ def execute_supplemental_growth(plan, *, query_field, check_segment,
             reason = check_segment(point, endpoint, int(partition))
             if reason is not None:
                 break
+            if commit_step is not None:
+                commit_step(point.copy(), endpoint.copy(), int(partition))
             path.append(endpoint.copy())
             point = endpoint
             length += step

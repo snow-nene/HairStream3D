@@ -98,7 +98,7 @@ def main():
 
     # ─── Step 3: 加载头部模型关键点并计算对齐 ───
     print("\n[Step 3] 计算对齐参数 (Umeyama)...")
-    head_verts, _ = load_obj_mesh(args.head)
+    head_verts, head_faces = load_obj_mesh(args.head)
     landmark_ids = load_point_ids("data/landmark_id_uschair.obj")
     head_lmk = head_verts[landmark_ids]
     
@@ -119,7 +119,8 @@ def main():
     print("\n[Step 4.5] 运行密集 ICP 对齐 (面部区域微调)...")
     head_mesh = o3d.geometry.TriangleMesh()
     head_mesh.vertices = o3d.utility.Vector3dVector(head_verts)
-    head_mesh.triangles = o3d.utility.Vector3iVector(np.asarray(o3d.io.read_triangle_mesh(args.head).triangles))
+    # 顶点与面索引必须来自同一读取器；Open3D 的 OBJ 导入会重排顶点。
+    head_mesh.triangles = o3d.utility.Vector3iVector(head_faces)
     head_mesh.compute_vertex_normals()
     
     lmk_min = head_lmk.min(axis=0)

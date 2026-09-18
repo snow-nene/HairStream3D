@@ -18,15 +18,16 @@ def main():
     ap.add_argument('--input',type=Path,required=True);ap.add_argument('--output-dir',type=Path,required=True)
     ap.add_argument('--views',nargs='+',choices=['front','left','right','back'],default=['front'])
     ap.add_argument('--allow-unbound-template',action='store_true',help='仅用于历史结果，不作为模板碰撞安全输出')
+    ap.add_argument('--template',type=Path,default=Path('assets/render_template.blend'))
     args=ap.parse_args(sys.argv[sys.argv.index('--')+1:])
     args.output_dir.mkdir(parents=True,exist_ok=False)
     d=np.load(args.input)
-    template_identity=require_bound_template(d,Path('assets/render_template.blend'),args.allow_unbound_template)
+    template_identity=require_bound_template(d,args.template,args.allow_unbound_template)
     strands=d['strands'];pieces=[];ids=[]
     for i,s in enumerate(strands):
         keep=np.r_[True,np.linalg.norm(np.diff(s,axis=0),axis=1)>1e-8]
         if keep.sum()>1:pieces.append(s[keep]);ids.append(i)
-    bpy.ops.wm.open_mainfile(filepath=str(Path('assets/render_template.blend').resolve()))
+    bpy.ops.wm.open_mainfile(filepath=str(args.template.resolve()))
     hair=create_curves_from_strands('all_valid_root_prefixes',pieces,bevel_depth=.0003,root_taper_points=3,tip_taper_points=4)
     mat=bpy.data.materials.get('Hair')
     if mat is None:

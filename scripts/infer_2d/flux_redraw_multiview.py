@@ -109,13 +109,15 @@ def main():
                         help='Original photograph; otherwise use the unique raw_img image in the image directory')
     parser.add_argument('--seed', type=int, default=42,
                         help='Stable per-view generation seed, independent of view order')
+    parser.add_argument('--output-dir', type=str, default=None,
+                        help='独立输出目录；用于多种子审计，默认使用 flux_redrawn')
     args = parser.parse_args()
     selected_map_views(args.views)  # Validate names/duplicates without adding front.
 
 
     data_dir = os.path.join("results", "multiview_data", args.img_id)
     render_dir = os.path.join(data_dir, "blender_renders")
-    out_dir = os.path.join(data_dir, "flux_redrawn")
+    out_dir = args.output_dir or os.path.join(data_dir, "flux_redrawn")
     os.makedirs(out_dir, exist_ok=True)
     for view in args.views:
         if not os.path.isfile(os.path.join(render_dir, f'{view}.png')):

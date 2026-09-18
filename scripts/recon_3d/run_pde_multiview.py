@@ -5036,6 +5036,11 @@ def main():
             json.dump(final_audit, stream, indent=2)
         if not final_audit["passed"]:
             raise RuntimeError("Final volume audit failed; candidate retained, PLY not published")
+    else:
+        np.savez_compressed(
+            os.path.join(out_dir, "final_strands_candidate.npz"),
+            strands=strands,
+        )
     save_strands_with_mesh(strands, args.mesh_obj, out_ply, 0.3, is_eval=False)
     if volume_bundle is not None:
         exported = o3d.io.read_line_set(out_ply)

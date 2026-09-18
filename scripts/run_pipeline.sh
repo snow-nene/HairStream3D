@@ -7,21 +7,28 @@
 #   ./scripts/run_pipeline.sh --img_id <img_id> [--stages stage1 stage2 ...]
 #
 # 支持分阶段执行:
-#   prepare  : 输入原始单张图片，抠图并提取 2D 特征图 (strand/depth/seg)
-#   pixal3d  : 通过 Pixal3D 生成初始 3D 网格 (glb)
-#   extract  : 从 GLB 中对齐并提取 3D 毛发网格 (obj)
-#   render   : 使用 Blender 将 3D 网格渲染为多视角图像 (front/left/right/back)
-#   flux     : 使用 FLUX.2-klein 对渲染图进行发丝增强重绘
-#   maps     : 提取多视角特征图 (strand_map, depth_map, seg)
-#   pde      : 融合多视角并进行 3D PDE 求解，生成最终 hair_multiview.ply (默认为多视角，也可跑单视角)
-#   preview  : 最终步骤，将生成的 3D 毛发网格重新渲染为 2D 预览图
+#   prepare     : 输入原始单张图片，抠图并提取 2D 特征图 (strand/depth/seg)
+#   pixal3d     : 通过 Pixal3D 生成初始 3D 网格 (glb)
+#   extract     : 从 GLB 中对齐并提取 3D 毛发网格 (obj)
+#   align_calib : 原图、GLB 与 DINOv3+轮廓标定
+#   render      : 使用 Blender 将 3D 网格渲染为多视角图像 (front/left/right/back)
+#   flux        : 使用 FLUX.2-klein 对渲染图进行发丝增强重绘
+#   maps        : 提取多视角特征图 (strand_map, depth_map, seg)
+#   partition   : 可选阶段，组装可见证据与体积分区 bundle (build_volume_partition_bundle.py)
+#   pde         : 融合多视角并进行 3D PDE 求解，生成最终 3D 发丝 (run_pde_multiview.py)
+#   fit_head    : 适配求值 Blender 模板头模，消除穿模并约束管径间隙 (fit_strands_to_template_head.py)
+#   grow_surface: 可选阶段，从标定视角可见头皮缺口增补表面发丝 (grow_visible_surface_gaps.py)
+#   preview     : 渲染 3D 发丝多视角预览图 (render_all_prefixes.py / render_blender.py)
 # 
 # 示例:
-#   # 运行全部阶段 (默认)
+#   # 运行全部默认阶段
 #   bash scripts/run_pipeline.sh --img_id 0a1ba3dbefc8934ab60577c5c91f66a0
+#
+#   # 启用体积分区与表面补生长完整闭环
+#   bash scripts/run_pipeline.sh --img_id 0a1ba3dbefc8934ab60577c5c91f66a0 --with-partition --with-grow-surface
 #   
-#   # 仅运行后续 2 个阶段
-#   bash scripts/run_pipeline.sh --img_id 0a1ba3dbefc8934ab60577c5c91f66a0 --stages maps pde
+#   # 仅运行贴合与补生长阶段
+#   bash scripts/run_pipeline.sh --img_id 0a1ba3dbefc8934ab60577c5c91f66a0 --stages fit_head grow_surface preview
 
 IMG_ID=""
 RAW_IMG=""
@@ -29,6 +36,13 @@ STAGES=()
 VIEWS=("front" "left" "right" "back")
 PDE_MODE="governed"
 VOLUME_PARTITION_BUNDLE=""
+WITH_PARTITION=false
+WITH_GROW_SURFACE=false
+PARTITION_SEED_GEOMETRY="mesh_raycast"
+TEMPLATE_HEAD_PATH=""
+SURFACE_GROWTH_VIEW="back"
+SURFACE_GROWTH_BUDGET=300
+SURFACE_OFFSET_M="0.0008"
 
 # 参数解析
 POSITIONAL_ARGS=()
@@ -39,6 +53,13 @@ while [[ "$#" -gt 0 ]]; do
         --pde-mode) PDE_MODE="$2"; shift ;;
         --volume-partition-bundle) VOLUME_PARTITION_BUNDLE="$2"; shift ;;
         --legacy-pde) PDE_MODE="legacy" ;;
+        --with-partition) WITH_PARTITION=true ;;
+        --with-grow-surface) WITH_GROW_SURFACE=true ;;
+        --partition-seed-geometry) PARTITION_SEED_GEOMETRY="$2"; shift ;;
+        --template-head) TEMPLATE_HEAD_PATH="$2"; shift ;;
+        --surface-growth-view) SURFACE_GROWTH_VIEW="$2"; shift ;;
+        --surface-growth-budget) SURFACE_GROWTH_BUDGET="$2"; shift ;;
+        --surface-offset-m) SURFACE_OFFSET_M="$2"; shift ;;
         --views)
             shift
             VIEWS=()
@@ -111,12 +132,19 @@ if [ "$PDE_MODE" != "governed" ] && [ "$PDE_MODE" != "legacy" ]; then
 fi
 
 if [ ${#STAGES[@]} -eq 0 ]; then
-    # 如果指定了 raw_img，默认包含 prepare 阶段
+    STAGES=()
     if [ -n "$RAW_IMG" ]; then
-        STAGES=("prepare" "pixal3d" "extract" "align_calib" "render" "flux" "maps" "pde" "preview")
-    else
-        STAGES=("pixal3d" "extract" "align_calib" "render" "flux" "maps" "pde" "preview")
+        STAGES+=("prepare")
     fi
+    STAGES+=("pixal3d" "extract" "align_calib" "render" "flux" "maps")
+    if [ "$WITH_PARTITION" = true ]; then
+        STAGES+=("partition")
+    fi
+    STAGES+=("pde" "fit_head")
+    if [ "$WITH_GROW_SURFACE" = true ]; then
+        STAGES+=("grow_surface")
+    fi
+    STAGES+=("preview")
 fi
 
 run_stage() {
@@ -381,9 +409,49 @@ if run_stage "maps"; then
     fi
 fi
 
+if run_stage "partition"; then
+    echo "=================================================="
+    echo " [4.5/8] Partition: 组装体积分区 Bundle"
+    echo "=================================================="
+    MESH_PATH="${DATA_DIR}/pixal3d/hair_mesh_aligned_best.obj"
+    if [ ! -f "$MESH_PATH" ]; then
+        echo "错误: 找不到 3D 毛发网格 $MESH_PATH，请先完成 extract 阶段。"
+        exit 1
+    fi
+    AUDIT_DIR="${DATA_DIR}/pde_governance/volume_domain_audit"
+    STEP7="${AUDIT_DIR}/step_07_surface_evidence_continuity/refined_evidence.npz"
+    STEP6="${AUDIT_DIR}/step_06_four_class_evidence/volume_evidence.npz"
+    STEP5="${AUDIT_DIR}/step_05_closed_external_envelope/closed_outer_candidate.npz"
+    if [ ! -f "$STEP7" ] || [ ! -f "$STEP6" ] || [ ! -f "$STEP5" ]; then
+        echo "错误: partition 阶段需要 volume_domain_audit 前置审计产物 (step_05, step_06, step_07)。"
+        echo "       未在 ${AUDIT_DIR} 下找到完整的 refined_evidence / volume_evidence / closed_outer_candidate。"
+        exit 1
+    fi
+
+    BUNDLE_OUT_DIR="${DATA_DIR}/pde_governance/volume_partition_integration/bundle"
+    mkdir -p "$BUNDLE_OUT_DIR"
+
+    echo "  --> 正在调用 build_volume_partition_bundle.py 组装体积分区 bundle..."
+    OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 MPLCONFIGDIR=/tmp/hairstream-volume-mpl \
+    pixi run python scripts/recon_3d/build_volume_partition_bundle.py \
+        --data-dir "$DATA_DIR" \
+        --output-dir "$BUNDLE_OUT_DIR" \
+        --mesh "$MESH_PATH" \
+        --views "${VIEWS[@]}" \
+        --seed-geometry "$PARTITION_SEED_GEOMETRY"
+
+    if [ -f "${BUNDLE_OUT_DIR}/volume_partition_bundle.npz" ]; then
+        VOLUME_PARTITION_BUNDLE="${BUNDLE_OUT_DIR}/volume_partition_bundle.npz"
+        echo "  ✓ 体积分区 Bundle 生成完毕: $VOLUME_PARTITION_BUNDLE"
+    else
+        echo "  [ERROR] build_volume_partition_bundle.py 未能生成 volume_partition_bundle.npz！"
+        exit 1
+    fi
+fi
+
 if run_stage "pde"; then
     echo "=================================================="
-    echo " [5/6] PDE: 3D 融合解算 (生成毛发)"
+    echo " [5/8] PDE: 3D 融合解算 (生成毛发)"
     echo "=================================================="
     PDE_ARGS=(
         "--img_id" "$IMG_ID"
@@ -394,17 +462,29 @@ if run_stage "pde"; then
 
     if [ "$PDE_MODE" = "governed" ]; then
         if [ -z "$VOLUME_PARTITION_BUNDLE" ]; then
-            VOLUME_PARTITION_BUNDLE="${DATA_DIR}/pde_governance/volume_partition_integration/volume_partition_bundle.npz"
+            if [ -f "${DATA_DIR}/pde_governance/volume_partition_integration/bundle/volume_partition_bundle.npz" ]; then
+                VOLUME_PARTITION_BUNDLE="${DATA_DIR}/pde_governance/volume_partition_integration/bundle/volume_partition_bundle.npz"
+            elif [ -f "${DATA_DIR}/pde_governance/volume_partition_integration/volume_partition_bundle.npz" ]; then
+                VOLUME_PARTITION_BUNDLE="${DATA_DIR}/pde_governance/volume_partition_integration/volume_partition_bundle.npz"
+            else
+                FOUND_BUNDLE=($(find "${DATA_DIR}/pde_governance/volume_partition_integration" \( -name "*trusted_partition_bundle*.npz" -o -name "*partition_bundle*.npz" -o -name "*bundle*.npz" \) 2>/dev/null | head -n 1 || true))
+                if [ ${#FOUND_BUNDLE[@]} -gt 0 ] && [ -f "${FOUND_BUNDLE[0]}" ]; then
+                    VOLUME_PARTITION_BUNDLE="${FOUND_BUNDLE[0]}"
+                    echo "  [INFO] 自动采用已审计体积分区 Bundle: $VOLUME_PARTITION_BUNDLE"
+                fi
+            fi
         fi
         if [ ! -f "$VOLUME_PARTITION_BUNDLE" ]; then
             echo "错误: governed PDE 需要可验证的体积分区 bundle。"
             echo "       未找到: $VOLUME_PARTITION_BUNDLE"
-            echo "       请先运行 build_volume_partition_bundle.py，或显式使用 --legacy-pde。"
+            echo "       请先运行 partition 阶段 (或 build_volume_partition_bundle.py)，或显式使用 --legacy-pde。"
             exit 2
         fi
+        GOVERNED_OUT_DIR="${DATA_DIR}/pde_governance/volume_partition_integration/governed_pde"
         PDE_ARGS+=(
             "--pde_solver_mode" "screened_poisson"
             "--volume_partition_bundle" "$VOLUME_PARTITION_BUNDLE"
+            "--out_dir" "$GOVERNED_OUT_DIR"
         )
     else
         PDE_ARGS+=("--pde_solver_mode" "legacy_smooth" "--export-per-view")
@@ -425,23 +505,203 @@ if run_stage "pde"; then
     pixi run python scripts/recon_3d/run_pde_multiview.py "${PDE_ARGS[@]}"
 fi
 
+if run_stage "fit_head"; then
+    echo "=================================================="
+    echo " [6/8] FitHead: 适配 Blender 求值模板头模"
+    echo "=================================================="
+    # 查找发丝输入: 优先 governed_pde / pde_reconstruction
+    INPUT_STRANDS=""
+    if [ -f "${DATA_DIR}/pde_governance/volume_partition_integration/governed_pde/final_strands_candidate.npz" ]; then
+        INPUT_STRANDS="${DATA_DIR}/pde_governance/volume_partition_integration/governed_pde/final_strands_candidate.npz"
+    elif [ -f "${DATA_DIR}/pde_reconstruction/final_strands_candidate.npz" ]; then
+        INPUT_STRANDS="${DATA_DIR}/pde_reconstruction/final_strands_candidate.npz"
+    elif [ -f "${DATA_DIR}/pde_governance/volume_partition_integration/final_strands_candidate.npz" ]; then
+        INPUT_STRANDS="${DATA_DIR}/pde_governance/volume_partition_integration/final_strands_candidate.npz"
+    fi
+
+    if [ -z "$INPUT_STRANDS" ]; then
+        CANDIDATES=($(find "${DATA_DIR}/pde_governance" \( -name "all_root_prefixes.npz" -o -name "final_strands_candidate.npz" -o -name "*strands*.npz" -o -name "bridge_source.npz" \) 2>/dev/null | head -n 1 || true))
+        if [ ${#CANDIDATES[@]} -gt 0 ] && [ -f "${CANDIDATES[0]}" ]; then
+            INPUT_STRANDS="${CANDIDATES[0]}"
+        fi
+    fi
+
+    # 兼容已有 legacy ply 但缺少 npz 的场景
+    if [ -z "$INPUT_STRANDS" ] && [ -f "${DATA_DIR}/pde_reconstruction/hair_multiview.ply" ]; then
+        echo "  --> 从 ${DATA_DIR}/pde_reconstruction/hair_multiview.ply 转换提取 strands npz..."
+        INPUT_STRANDS="${DATA_DIR}/pde_reconstruction/final_strands_candidate.npz"
+        pixi run python -c "
+import open3d as o3d, numpy as np
+ply = o3d.io.read_line_set('${DATA_DIR}/pde_reconstruction/hair_multiview.ply')
+pts = np.asarray(ply.points)
+lines = np.asarray(ply.lines)
+if len(lines) > 0:
+    starts = np.where(lines[1:, 0] != lines[:-1, 1])[0] + 1
+    strand_indices = np.split(lines, starts)
+    strands = []
+    for s_lines in strand_indices:
+        if len(s_lines) == 0: continue
+        strand_pts = [pts[s_lines[0, 0]]] + [pts[l[1]] for l in s_lines]
+        strands.append(strand_pts)
+    max_len = max(len(s) for s in strands)
+    padded = np.zeros((len(strands), max_len, 3), dtype=np.float32)
+    for i, s in enumerate(strands):
+        padded[i, :len(s)] = s
+        padded[i, len(s):] = s[-1]
+    np.savez_compressed('${INPUT_STRANDS}', strands=padded)
+"
+    fi
+
+    if [ -z "$INPUT_STRANDS" ] || [ ! -f "$INPUT_STRANDS" ]; then
+        echo "错误: 未找到发丝输入文件 (预期为 ${DATA_DIR}/pde_reconstruction/final_strands_candidate.npz)。请先完成 pde 阶段。"
+        exit 1
+    fi
+
+    # 检查求值头模是否存在，若不存在则调用 Blender 导出
+    HEAD_NPZ="$TEMPLATE_HEAD_PATH"
+    if [ -z "$HEAD_NPZ" ]; then
+        CANDIDATE_HEAD=($(find "${DATA_DIR}" -name "template_head.npz" 2>/dev/null | head -n 1 || true))
+        if [ ${#CANDIDATE_HEAD[@]} -gt 0 ] && [ -f "${CANDIDATE_HEAD[0]}" ]; then
+            HEAD_NPZ="${CANDIDATE_HEAD[0]}"
+        elif [ -f "assets/template_head.npz" ]; then
+            HEAD_NPZ="assets/template_head.npz"
+        else
+            HEAD_DIR="${DATA_DIR}/template_head"
+            echo "  --> 正在从 assets/render_template.blend 导出求值头模到 ${HEAD_DIR}..."
+            rm -rf "$HEAD_DIR"
+            blender -b assets/render_template.blend -P scripts/render/export_template_head.py -- --output-dir "$HEAD_DIR"
+            HEAD_NPZ="${HEAD_DIR}/template_head.npz"
+        fi
+    fi
+
+    if [ ! -f "$HEAD_NPZ" ]; then
+        echo "错误: 无法获取模板头模 $HEAD_NPZ。"
+        exit 1
+    fi
+
+    FIT_OUT="${DATA_DIR}/template_head_fit"
+    if [ -d "$FIT_OUT" ]; then
+        echo "  --> 清理旧贴合输出目录: $FIT_OUT"
+        rm -rf "$FIT_OUT"
+    fi
+
+    echo "  --> 正在执行模板头模贴合与间隙投影..."
+    pixi run python scripts/recon_3d/fit_strands_to_template_head.py \
+        --input "$INPUT_STRANDS" \
+        --head "$HEAD_NPZ" \
+        --output-dir "$FIT_OUT"
+
+    echo "  ✓ 模板头模贴合完成: ${FIT_OUT}/all_root_prefixes.npz"
+fi
+
+if run_stage "grow_surface"; then
+    echo "=================================================="
+    echo " [7/8] GrowSurface: 可见表面缺口发丝补生长"
+    echo "=================================================="
+    # 查找输入发丝：优先 template_head_fit/all_root_prefixes.npz
+    GROW_INPUT=""
+    if [ -f "${DATA_DIR}/template_head_fit/all_root_prefixes.npz" ]; then
+        GROW_INPUT="${DATA_DIR}/template_head_fit/all_root_prefixes.npz"
+    elif [ -f "${DATA_DIR}/pde_reconstruction/final_strands_candidate.npz" ]; then
+        GROW_INPUT="${DATA_DIR}/pde_reconstruction/final_strands_candidate.npz"
+    fi
+
+    if [ -z "$GROW_INPUT" ] || [ ! -f "$GROW_INPUT" ]; then
+        echo "错误: grow_surface 需要输入发丝 (请先完成 fit_head 阶段)。"
+        exit 1
+    fi
+
+    # 头模路径
+    HEAD_NPZ="$TEMPLATE_HEAD_PATH"
+    if [ -z "$HEAD_NPZ" ]; then
+        CANDIDATE_HEAD=($(find "${DATA_DIR}" -name "template_head.npz" 2>/dev/null | head -n 1 || true))
+        if [ ${#CANDIDATE_HEAD[@]} -gt 0 ] && [ -f "${CANDIDATE_HEAD[0]}" ]; then
+            HEAD_NPZ="${CANDIDATE_HEAD[0]}"
+        elif [ -f "assets/template_head.npz" ]; then
+            HEAD_NPZ="assets/template_head.npz"
+        else
+            HEAD_DIR="${DATA_DIR}/template_head"
+            rm -rf "$HEAD_DIR"
+            blender -b assets/render_template.blend -P scripts/render/export_template_head.py -- --output-dir "$HEAD_DIR"
+            HEAD_NPZ="${HEAD_DIR}/template_head.npz"
+        fi
+    fi
+
+    # 导出或获取模板相机
+    CAM_DIR="${DATA_DIR}/template_cameras"
+    if [ ! -f "${CAM_DIR}/${SURFACE_GROWTH_VIEW}.npz" ]; then
+        echo "  --> 正在导出 Blender 模板评估相机到 ${CAM_DIR}..."
+        rm -rf "$CAM_DIR"
+        blender -b assets/render_template.blend -P scripts/render/export_template_camera.py -- --output-dir "$CAM_DIR"
+    fi
+
+    GROW_OUT="${DATA_DIR}/surface_growth"
+    if [ -d "$GROW_OUT" ]; then
+        echo "  --> 清理旧补生长输出目录: $GROW_OUT"
+        rm -rf "$GROW_OUT"
+    fi
+
+    GROW_ARGS=(
+        "--data-dir" "$DATA_DIR"
+        "--input" "$GROW_INPUT"
+        "--head" "$HEAD_NPZ"
+        "--output-dir" "$GROW_OUT"
+        "--view" "$SURFACE_GROWTH_VIEW"
+        "--budget" "$SURFACE_GROWTH_BUDGET"
+        "--surface-offset-m" "$SURFACE_OFFSET_M"
+    )
+    if [ -f "${CAM_DIR}/${SURFACE_GROWTH_VIEW}.npz" ]; then
+        GROW_ARGS+=("--coverage-camera" "${CAM_DIR}/${SURFACE_GROWTH_VIEW}.npz")
+    fi
+
+    echo "  --> 正在执行表面缺口补生长 (视角: $SURFACE_GROWTH_VIEW, 预算: $SURFACE_GROWTH_BUDGET)..."
+    pixi run python scripts/recon_3d/grow_visible_surface_gaps.py "${GROW_ARGS[@]}"
+
+    if [ -f "${GROW_OUT}/all_root_prefixes.npz" ]; then
+        pixi run python -c "
+import numpy as np
+from scripts.recon_3d.recover_boundary_strands import export_all
+d = np.load('${GROW_OUT}/all_root_prefixes.npz')
+export_all('${GROW_OUT}/all_root_prefixes.ply', d['strands'])
+" 2>/dev/null || true
+    fi
+    echo "  ✓ 表面缺口补生长完成: ${GROW_OUT}/all_root_prefixes.npz"
+fi
+
 if run_stage "preview"; then
     echo "=================================================="
-    echo " [6/6] Preview: 渲染最终 3D 毛发预览图"
+    echo " [8/8] Preview: 渲染最终 3D 毛发预览图"
     echo "=================================================="
-    if [ "$PDE_MODE" = "governed" ]; then
-        echo "  [INFO] governed PDE 不直接渲染未绑定发丝。请先完成模板头模适配，再调用 render_all_prefixes.py。"
-        exit 0
+    PREVIEW_RENDER_NPZ=""
+    if [ -f "${DATA_DIR}/surface_growth/all_root_prefixes.npz" ]; then
+        PREVIEW_RENDER_NPZ="${DATA_DIR}/surface_growth/all_root_prefixes.npz"
+    elif [ -f "${DATA_DIR}/template_head_fit/all_root_prefixes.npz" ]; then
+        PREVIEW_RENDER_NPZ="${DATA_DIR}/template_head_fit/all_root_prefixes.npz"
     fi
-    # legacy PDE 输出保存在 pde_reconstruction/hair_multiview.ply
-    PLY_PATH="${DATA_DIR}/pde_reconstruction/hair_multiview.ply"
-    if [ ! -f "$PLY_PATH" ]; then
-        echo "警告: 未找到 $PLY_PATH，跳过预览阶段。"
+
+    if [ -n "$PREVIEW_RENDER_NPZ" ]; then
+        PREVIEW_OUT="${DATA_DIR}/preview_renders"
+        if [ -d "$PREVIEW_OUT" ]; then
+            rm -rf "$PREVIEW_OUT"
+        fi
+        echo "  --> 使用 Blender 模板渲染绑定的发丝前缀: $PREVIEW_RENDER_NPZ"
+        blender -b assets/render_template.blend -P scripts/render/render_all_prefixes.py -- \
+            --input "$PREVIEW_RENDER_NPZ" \
+            --output-dir "$PREVIEW_OUT" \
+            --views "${VIEWS[@]}"
+        echo "  ✓ 渲染预览图已保存到: ${PREVIEW_OUT}/"
     else
-        blender -b --factory-startup assets/render_template.blend -P scripts/render/render_blender.py -- \
-            --hair_path "$PLY_PATH" \
-            --save_blend "${DATA_DIR}/pde_reconstruction/scene_with_hair.blend" \
-            --output_path "${DATA_DIR}/pde_reconstruction/preview.png"
+        # 回退至旧版未绑定发丝预览
+        PLY_PATH="${DATA_DIR}/pde_reconstruction/hair_multiview.ply"
+        if [ ! -f "$PLY_PATH" ]; then
+            echo "警告: 未找到 $PLY_PATH 或有效 template-bound 发丝，跳过预览阶段。"
+        else
+            blender -b --factory-startup assets/render_template.blend -P scripts/render/render_blender.py -- \
+                --hair_path "$PLY_PATH" \
+                --save_blend "${DATA_DIR}/pde_reconstruction/scene_with_hair.blend" \
+                --output_path "${DATA_DIR}/pde_reconstruction/preview.png"
+            echo "  ✓ 旧版 PLY 渲染预览图已保存到: ${DATA_DIR}/pde_reconstruction/preview.png"
+        fi
     fi
 fi
 
